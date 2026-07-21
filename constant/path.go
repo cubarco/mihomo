@@ -93,7 +93,7 @@ func (p *path) Resolve(path string) string {
 // IsSafePath return true if path is a subpath of homedir (or in the SAFE_PATHS environment variable)
 func (p *path) IsSafePath(path string) bool {
 	force := forceSafePathCheck.Load()
-	if !force && (p.allowUnsafePath || features.Android) {
+	if !force && (p.allowUnsafePath || features.CMFA) {
 		return true
 	}
 	path = p.Resolve(path)

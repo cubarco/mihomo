@@ -27,7 +27,6 @@ jobs:
           - { goos: windows, goarch: amd64, goamd64: v1, output: amd64-v1 }
           - { goos: darwin, goarch: amd64, goamd64: v1, output: amd64-v1 }
           - { goos: darwin, goarch: arm64, output: arm64 }
-          - { goos: android, goarch: arm64, ndk: aarch64-linux-android34, output: arm64-v8 }
     env:
       CGO_ENABLED: "0"
       DNS_AUTH_PRIVATE_KEY: ${{ secrets.MIHOMO_DNS_AUTH_PRIVATE_KEY }}
@@ -59,21 +58,6 @@ jobs:
           echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
           echo "CGO_ENABLED=0" >> "$GITHUB_ENV"
           echo "BUILD_EXTLDFLAGS=-extldflags --static" >> "$GITHUB_ENV"
-
-      - name: Set up Android NDK
-        if: ${{ matrix.goos == 'android' }}
-        uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: r29-beta1
-
-      - name: Set Android build environment
-        if: ${{ matrix.goos == 'android' }}
-        shell: bash
-        run: |
-          echo "CC=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.ndk }}-clang" >> "$GITHUB_ENV"
-          echo "CGO_ENABLED=1" >> "$GITHUB_ENV"
-          echo "BUILD_EXTLDFLAGS=" >> "$GITHUB_ENV"
 
       - name: Build
         shell: bash
@@ -131,7 +115,7 @@ jobs:
           cd release
           find . -maxdepth 1 -type f ! -name '*.gz' ! -name '*.zip' -delete
           mapfile -d '' archives < <(find . -maxdepth 1 -type f \( -name '*.gz' -o -name '*.zip' \) -print0 | sort -z)
-          test "${#archives[@]}" -eq 7
+          test "${#archives[@]}" -eq 6
           printf '%s\0' "${archives[@]}" | xargs -0 sha256sum > SHA256SUMS
 
       - name: Update custom-latest release

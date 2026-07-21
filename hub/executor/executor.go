@@ -105,8 +105,8 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateGeneral(cfg.General, true)
 	updateNTP(cfg.NTP)
 	updateDNS(cfg.DNS, cfg.General.IPv6)
-	//updateListeners(cfg.General, cfg.Listeners, force)
-	//updateTun(cfg.General) // tun should not care "force"
+	updateListeners(cfg.General, cfg.Listeners, force)
+	updateTun(cfg.General) // tun should not care "force"
 	updateIPTables(cfg)
 	updateTunnels(cfg.Tunnels)
 
@@ -316,8 +316,6 @@ func updateRules(rules []C.Rule, subRules map[string][]C.Rule, ruleProviders map
 }
 
 func loadProvider[T P.Provider](providers map[string]T) {
-	loadedHook := DefaultProviderLoadedHook
-	loadedNames := make(chan string, len(providers))
 	load := func(pv T) {
 		name := pv.Name()
 		if pv.VehicleType() == P.Compatible {
@@ -337,8 +335,6 @@ func loadProvider[T P.Provider](providers map[string]T) {
 					log.Warnln("initial rule provider %s error: %v", name, err)
 				}
 			}
-		} else if loadedHook != nil {
-			loadedNames <- name
 		}
 	}
 
@@ -354,14 +350,6 @@ func loadProvider[T P.Provider](providers map[string]T) {
 		}()
 	}
 	wg.Wait()
-	close(loadedNames)
-	if loadedHook != nil && len(loadedNames) > 0 {
-		go func() {
-			for name := range loadedNames {
-				loadedHook(name)
-			}
-		}()
-	}
 }
 
 func updateSniffer(snifferConfig *sniffer.Config) {

@@ -1,6 +1,9 @@
 package features
 
 func Tags() (tags []string) {
+	if CMFA {
+		tags = append(tags, "cmfa")
+	}
 	if WithLowMemory {
 		tags = append(tags, "with_low_memory")
 	}

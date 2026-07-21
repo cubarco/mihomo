@@ -16,12 +16,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-var healthCheckSuspended = atomic.NewBool(false)
-
-func SetHealthCheckSuspended(suspended bool) {
-	healthCheckSuspended.Store(suspended)
-}
-
 type HealthCheckOption struct {
 	URL      string
 	Interval uint
@@ -53,9 +47,6 @@ func (hc *HealthCheck) process() {
 	for {
 		select {
 		case <-ticker.C:
-			if healthCheckSuspended.Load() {
-				continue
-			}
 			lastTouch := hc.lastTouch.Load()
 			since := time.Since(lastTouch)
 			if !hc.lazy || since < hc.interval {
@@ -132,9 +123,6 @@ func (hc *HealthCheck) touch() {
 }
 
 func (hc *HealthCheck) check() {
-	if healthCheckSuspended.Load() {
-		return
-	}
 	hc.mu.Lock()
 	proxies := append([]C.Proxy(nil), hc.proxies...)
 	extra := make(map[string]*extraOption, len(hc.extra))
@@ -156,9 +144,6 @@ func (hc *HealthCheck) check() {
 	}
 
 	_, _, _ = hc.singleDo.Do(func() (struct{}, error) {
-		if healthCheckSuspended.Load() {
-			return struct{}{}, nil
-		}
 		id := utils.NewUUIDV4().String()
 		log.Debugln("Start New Health Checking {%s}", id)
 		b := new(errgroup.Group)
