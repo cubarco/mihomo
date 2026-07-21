@@ -10,31 +10,46 @@ import (
 	tlsC "github.com/metacubex/mihomo/component/tls"
 
 	"github.com/metacubex/tls"
+	utls "github.com/metacubex/utls"
 )
 
 type TLSConfig struct {
-	Host              string
-	SkipCertVerify    bool
-	FingerPrint       string
-	Certificate       string
-	PrivateKey        string
-	ClientFingerprint string
-	NextProtos        []string
-	ECH               *ech.Config
-	Reality           *tlsC.RealityConfig
+	Host                string
+	SkipCertVerify      bool
+	CAFile              string
+	FingerPrint         string
+	Certificate         string
+	PrivateKey          string
+	ClientFingerprint   string
+	NextProtos          []string
+	ECH                 *ech.Config
+	Reality             *tlsC.RealityConfig
+	ClientSessionCache  tls.ClientSessionCache
+	UClientSessionCache utls.ClientSessionCache
 }
 
 func (cfg *TLSConfig) ToStdConfig() (*tls.Config, error) {
-	return ca.GetTLSConfig(ca.Option{
+	tlsConfig, err := ca.GetTLSConfig(ca.Option{
 		TLSConfig: &tls.Config{
 			ServerName:         cfg.Host,
 			InsecureSkipVerify: cfg.SkipCertVerify,
 			NextProtos:         cfg.NextProtos,
+			ClientSessionCache: cfg.ClientSessionCache,
 		},
 		Fingerprint: cfg.FingerPrint,
 		Certificate: cfg.Certificate,
 		PrivateKey:  cfg.PrivateKey,
 	})
+	if err != nil {
+		return nil, err
+	}
+	if cfg.CAFile != "" {
+		tlsConfig.RootCAs, err = ca.LoadCertificates(cfg.CAFile)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return tlsConfig, nil
 }
 
 func StreamTLSConn(ctx context.Context, conn net.Conn, cfg *TLSConfig) (net.Conn, error) {
@@ -48,6 +63,7 @@ func StreamTLSConn(ctx context.Context, conn net.Conn, cfg *TLSConfig) (net.Conn
 			return tlsC.GetRealityConn(ctx, conn, clientFingerprint, tlsConfig.ServerName, cfg.Reality)
 		}
 		tlsConfig := tlsC.UConfig(tlsConfig)
+		tlsConfig.ClientSessionCache = cfg.UClientSessionCache
 		err = cfg.ECH.ClientHandleUTLS(ctx, tlsConfig)
 		if err != nil {
 			return nil, err

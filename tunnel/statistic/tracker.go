@@ -14,6 +14,20 @@ import (
 	"github.com/gofrs/uuid/v5"
 )
 
+var MetadataProcessor func(*C.Metadata)
+
+func trackerMetadata(metadata *C.Metadata, remoteDestination string) *C.Metadata {
+	if metadata == nil {
+		return nil
+	}
+	copy := *metadata
+	copy.RemoteDst = remoteDestination
+	if MetadataProcessor != nil {
+		MetadataProcessor(&copy)
+	}
+	return &copy
+}
+
 type Tracker interface {
 	ID() string
 	Close() error
@@ -53,7 +67,7 @@ func (tt *tcpTracker) Read(b []byte) (int, error) {
 	n, err := tt.Conn.Read(b)
 	download := int64(n)
 	if tt.pushToManager {
-		tt.manager.PushDownloaded(download)
+		tt.manager.PushDownloaded(tt.Conn.Chains().Last(), download)
 	}
 	tt.DownloadTotal.Add(download)
 	return n, err
@@ -63,7 +77,7 @@ func (tt *tcpTracker) ReadBuffer(buffer *buf.Buffer) (err error) {
 	err = tt.Conn.ReadBuffer(buffer)
 	download := int64(buffer.Len())
 	if tt.pushToManager {
-		tt.manager.PushDownloaded(download)
+		tt.manager.PushDownloaded(tt.Chains().Last(), download)
 	}
 	tt.DownloadTotal.Add(download)
 	return
@@ -72,7 +86,7 @@ func (tt *tcpTracker) ReadBuffer(buffer *buf.Buffer) (err error) {
 func (tt *tcpTracker) UnwrapReader() (io.Reader, []N.CountFunc) {
 	return tt.Conn, []N.CountFunc{func(download int64) {
 		if tt.pushToManager {
-			tt.manager.PushDownloaded(download)
+			tt.manager.PushDownloaded(tt.Chains().Last(), download)
 		}
 		tt.DownloadTotal.Add(download)
 	}}
@@ -82,7 +96,7 @@ func (tt *tcpTracker) Write(b []byte) (int, error) {
 	n, err := tt.Conn.Write(b)
 	upload := int64(n)
 	if tt.pushToManager {
-		tt.manager.PushUploaded(upload)
+		tt.manager.PushUploaded(tt.Chains().Last(), upload)
 	}
 	tt.UploadTotal.Add(upload)
 	return n, err
@@ -92,7 +106,7 @@ func (tt *tcpTracker) WriteBuffer(buffer *buf.Buffer) (err error) {
 	upload := int64(buffer.Len())
 	err = tt.Conn.WriteBuffer(buffer)
 	if tt.pushToManager {
-		tt.manager.PushUploaded(upload)
+		tt.manager.PushUploaded(tt.Chains().Last(), upload)
 	}
 	tt.UploadTotal.Add(upload)
 	return
@@ -101,7 +115,7 @@ func (tt *tcpTracker) WriteBuffer(buffer *buf.Buffer) (err error) {
 func (tt *tcpTracker) UnwrapWriter() (io.Writer, []N.CountFunc) {
 	return tt.Conn, []N.CountFunc{func(upload int64) {
 		if tt.pushToManager {
-			tt.manager.PushUploaded(upload)
+			tt.manager.PushUploaded(tt.Chains().Last(), upload)
 		}
 		tt.UploadTotal.Add(upload)
 	}}
@@ -117,15 +131,13 @@ func (tt *tcpTracker) Upstream() any {
 }
 
 func NewTCPTracker(conn C.Conn, manager *Manager, metadata *C.Metadata, rule C.Rule, uploadTotal int64, downloadTotal int64, pushToManager bool) *tcpTracker {
-	metadata.RemoteDst = conn.RemoteDestination()
-
-	t := &tcpTracker{
+	tt := &tcpTracker{
 		Conn:    conn,
 		manager: manager,
 		TrackerInfo: &TrackerInfo{
 			UUID:          utils.NewUUIDV4(),
 			Start:         time.Now(),
-			Metadata:      metadata,
+			Metadata:      trackerMetadata(metadata, conn.RemoteDestination()),
 			Chain:         conn.Chains(),
 			ProviderChain: conn.ProviderChains(),
 			Rule:          "",
@@ -137,20 +149,20 @@ func NewTCPTracker(conn C.Conn, manager *Manager, metadata *C.Metadata, rule C.R
 
 	if pushToManager {
 		if uploadTotal > 0 {
-			manager.PushUploaded(uploadTotal)
+			manager.PushUploaded(tt.Chains().Last(), uploadTotal)
 		}
 		if downloadTotal > 0 {
-			manager.PushDownloaded(downloadTotal)
+			manager.PushDownloaded(tt.Chains().Last(), downloadTotal)
 		}
 	}
 
 	if rule != nil {
-		t.TrackerInfo.Rule = rule.RuleType().String()
-		t.TrackerInfo.RulePayload = rule.Payload()
+		tt.TrackerInfo.Rule = rule.RuleType().String()
+		tt.TrackerInfo.RulePayload = rule.Payload()
 	}
 
-	manager.Join(t)
-	return t
+	manager.Join(tt)
+	return tt
 }
 
 type udpTracker struct {
@@ -173,7 +185,7 @@ func (ut *udpTracker) ReadFrom(b []byte) (int, net.Addr, error) {
 	n, addr, err := ut.PacketConn.ReadFrom(b)
 	download := int64(n)
 	if ut.pushToManager {
-		ut.manager.PushDownloaded(download)
+		ut.manager.PushDownloaded(ut.Chains().Last(), download)
 	}
 	ut.DownloadTotal.Add(download)
 	return n, addr, err
@@ -183,7 +195,7 @@ func (ut *udpTracker) WaitReadFrom() (data []byte, put func(), addr net.Addr, er
 	data, put, addr, err = ut.PacketConn.WaitReadFrom()
 	download := int64(len(data))
 	if ut.pushToManager {
-		ut.manager.PushDownloaded(download)
+		ut.manager.PushDownloaded(ut.Chains().Last(), download)
 	}
 	ut.DownloadTotal.Add(download)
 	return
@@ -193,7 +205,7 @@ func (ut *udpTracker) WriteTo(b []byte, addr net.Addr) (int, error) {
 	n, err := ut.PacketConn.WriteTo(b, addr)
 	upload := int64(n)
 	if ut.pushToManager {
-		ut.manager.PushUploaded(upload)
+		ut.manager.PushUploaded(ut.Chains().Last(), upload)
 	}
 	ut.UploadTotal.Add(upload)
 	return n, err
@@ -209,15 +221,13 @@ func (ut *udpTracker) Upstream() any {
 }
 
 func NewUDPTracker(conn C.PacketConn, manager *Manager, metadata *C.Metadata, rule C.Rule, uploadTotal int64, downloadTotal int64, pushToManager bool) *udpTracker {
-	metadata.RemoteDst = conn.RemoteDestination()
-
 	ut := &udpTracker{
 		PacketConn: conn,
 		manager:    manager,
 		TrackerInfo: &TrackerInfo{
 			UUID:          utils.NewUUIDV4(),
 			Start:         time.Now(),
-			Metadata:      metadata,
+			Metadata:      trackerMetadata(metadata, conn.RemoteDestination()),
 			Chain:         conn.Chains(),
 			ProviderChain: conn.ProviderChains(),
 			Rule:          "",
@@ -229,10 +239,10 @@ func NewUDPTracker(conn C.PacketConn, manager *Manager, metadata *C.Metadata, ru
 
 	if pushToManager {
 		if uploadTotal > 0 {
-			manager.PushUploaded(uploadTotal)
+			manager.PushUploaded(ut.Chains().Last(), uploadTotal)
 		}
 		if downloadTotal > 0 {
-			manager.PushDownloaded(downloadTotal)
+			manager.PushDownloaded(ut.Chains().Last(), downloadTotal)
 		}
 	}
 

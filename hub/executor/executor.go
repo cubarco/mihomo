@@ -26,6 +26,7 @@ import (
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/resource"
 	"github.com/metacubex/mihomo/component/sniffer"
+	tlsC "github.com/metacubex/mihomo/component/tls"
 	"github.com/metacubex/mihomo/component/trie"
 	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
@@ -104,8 +105,8 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateGeneral(cfg.General, true)
 	updateNTP(cfg.NTP)
 	updateDNS(cfg.DNS, cfg.General.IPv6)
-	updateListeners(cfg.General, cfg.Listeners, force)
-	updateTun(cfg.General) // tun should not care "force"
+	//updateListeners(cfg.General, cfg.Listeners, force)
+	//updateTun(cfg.General) // tun should not care "force"
 	updateIPTables(cfg)
 	updateTunnels(cfg.Tunnels)
 
@@ -165,19 +166,20 @@ func GetGeneral() *config.General {
 			ASN:     geodata.ASNUrl(),
 			GeoSite: geodata.GeoSiteUrl(),
 		},
-		GeoAutoUpdate:     updater.GeoAutoUpdate(),
-		GeoUpdateInterval: updater.GeoUpdateInterval(),
-		GeodataMode:       geodata.GeodataMode(),
-		GeodataLoader:     geodata.LoaderName(),
-		GeositeMatcher:    geodata.SiteMatcherName(),
-		TCPConcurrent:     dialer.GetTcpConcurrent(),
-		FindProcessMode:   tunnel.FindProcessMode(),
-		Sniffing:          tunnel.IsSniffing(),
-		GlobalUA:          mihomoHttp.UA(),
-		ETagSupport:       resource.ETag(),
-		KeepAliveInterval: int(keepalive.KeepAliveInterval() / time.Second),
-		KeepAliveIdle:     int(keepalive.KeepAliveIdle() / time.Second),
-		DisableKeepAlive:  keepalive.DisableKeepAlive(),
+		GeoAutoUpdate:           updater.GeoAutoUpdate(),
+		GeoUpdateInterval:       updater.GeoUpdateInterval(),
+		GeodataMode:             geodata.GeodataMode(),
+		GeodataLoader:           geodata.LoaderName(),
+		GeositeMatcher:          geodata.SiteMatcherName(),
+		TCPConcurrent:           dialer.GetTcpConcurrent(),
+		FindProcessMode:         tunnel.FindProcessMode(),
+		Sniffing:                tunnel.IsSniffing(),
+		GlobalClientFingerprint: tlsC.GetGlobalFingerprint(),
+		GlobalUA:                mihomoHttp.UA(),
+		ETagSupport:             resource.ETag(),
+		KeepAliveInterval:       int(keepalive.KeepAliveInterval() / time.Second),
+		KeepAliveIdle:           int(keepalive.KeepAliveIdle() / time.Second),
+		DisableKeepAlive:        keepalive.DisableKeepAlive(),
 	}
 
 	return general
@@ -290,6 +292,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 	} else {
 		resolver.ProxyServerHostResolver = r.Resolver
 	}
+	resolver.ProxyServerHostResolver = resolver.WrapDNSAuthResolver(resolver.ProxyServerHostResolver)
 
 	if r.DirectResolver.Invalid() {
 		resolver.DirectHostResolver = r.DirectResolver
@@ -313,6 +316,8 @@ func updateRules(rules []C.Rule, subRules map[string][]C.Rule, ruleProviders map
 }
 
 func loadProvider[T P.Provider](providers map[string]T) {
+	loadedHook := DefaultProviderLoadedHook
+	loadedNames := make(chan string, len(providers))
 	load := func(pv T) {
 		name := pv.Name()
 		if pv.VehicleType() == P.Compatible {
@@ -325,13 +330,15 @@ func loadProvider[T P.Provider](providers map[string]T) {
 			switch pv.Type() {
 			case P.Proxy:
 				{
-					log.Errorln("initial proxy provider %s error: %v", name, err)
+					log.Warnln("initial proxy provider %s error: %v", name, err)
 				}
 			case P.Rule:
 				{
-					log.Errorln("initial rule provider %s error: %v", name, err)
+					log.Warnln("initial rule provider %s error: %v", name, err)
 				}
 			}
+		} else if loadedHook != nil {
+			loadedNames <- name
 		}
 	}
 
@@ -347,6 +354,14 @@ func loadProvider[T P.Provider](providers map[string]T) {
 		}()
 	}
 	wg.Wait()
+	close(loadedNames)
+	if loadedHook != nil && len(loadedNames) > 0 {
+		go func() {
+			for name := range loadedNames {
+				loadedHook(name)
+			}
+		}()
+	}
 }
 
 func updateSniffer(snifferConfig *sniffer.Config) {
@@ -421,6 +436,7 @@ func updateGeneral(general *config.General, logging bool) {
 	geodata.SetGeoSiteUrl(general.GeoXUrl.GeoSite)
 	geodata.SetMmdbUrl(general.GeoXUrl.Mmdb)
 	geodata.SetASNUrl(general.GeoXUrl.ASN)
+	tlsC.SetGlobalFingerprint(general.GlobalClientFingerprint)
 	mihomoHttp.SetUA(general.GlobalUA)
 	resource.SetETag(general.ETagSupport)
 }
