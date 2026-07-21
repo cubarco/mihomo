@@ -97,9 +97,9 @@ jobs:
             -o "dist/$output" \
             .
           if [ "${{ matrix.goos }}" = "windows" ]; then
-            (cd dist && zip -9 "${output%.exe}-${version}.zip" "$output")
+            (cd dist && zip -9 "${output%.exe}.zip" "$output")
           else
-            gzip -9 -c "dist/$output" > "dist/${output}-${version}.gz"
+            gzip -9 -c "dist/$output" > "dist/${output}.gz"
           fi
           (cd dist && sha256sum * > "SHA256SUMS-${{ matrix.goos }}-${{ matrix.output }}")
 
@@ -110,3 +110,63 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    if: github.ref == 'refs/heads/custom'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          cd release
+          find . -maxdepth 1 -type f ! -name '*.gz' ! -name '*.zip' -delete
+          mapfile -d '' archives < <(find . -maxdepth 1 -type f \( -name '*.gz' -o -name '*.zip' \) -print0 | sort -z)
+          test "${#archives[@]}" -eq 7
+          printf '%s\0' "${archives[@]}" | xargs -0 sha256sum > SHA256SUMS
+
+      - name: Update custom-latest release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="Automated custom build from commit ${GITHUB_SHA}."
+          if gh release view custom-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh api \
+              --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/git/refs/tags/custom-latest" \
+              -f sha="$GITHUB_SHA" \
+              -F force=true
+            gh release edit custom-latest \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Mihomo Custom Latest" \
+              --notes "$notes" \
+              --prerelease
+            gh release view custom-latest \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name' | while IFS= read -r asset; do
+                gh release delete-asset custom-latest "$asset" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --yes
+              done
+          else
+            gh release create custom-latest \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Mihomo Custom Latest" \
+              --notes "$notes" \
+              --prerelease
+          fi
+          gh release upload custom-latest release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
