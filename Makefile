@@ -61,6 +61,10 @@ all:linux-amd64-v3 linux-arm64\
 	darwin-amd64-v3 darwin-arm64\
  	windows-amd64-v3 windows-arm64\
 
+.PHONY: custom-local
+custom-local:
+	@./scripts/build-custom-local.sh
+
 
 darwin-all: darwin-amd64-v3 darwin-arm64
 
@@ -203,4 +207,3 @@ clean:
 
 CLANG ?= clang-14
 CFLAGS := -O2 -g -Wall -Werror $(CFLAGS)
-
