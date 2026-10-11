@@ -253,13 +253,6 @@ func TestSnellECHTLSRejectsConflictingALPNAlias(t *testing.T) {
 	}
 }
 
-func TestSnellECHTLSAcceptsPreviousProtocolAlias(t *testing.T) {
-	got, err := resolveSnellECHTLSALPN("", snellECHTLSPreviousALPN)
-	if err != nil || got != snellECHTLSALPN {
-		t.Fatalf("resolveSnellECHTLSALPN() = (%q, %v)", got, err)
-	}
-}
-
 func TestSnellRejectsAnyTLSObfs(t *testing.T) {
 	_, err := NewSnell(SnellOption{
 		Name:   "snell",
