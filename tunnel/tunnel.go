@@ -443,14 +443,18 @@ func handleUDPConn(packet C.PacketAdapter) {
 	}
 
 	key := packet.Key()
+	var diagnostic *udpSessionDiagnostic
 	sender, loaded := natTable.GetOrCreate(key, func() C.PacketSender {
-		sender := newPacketSender()
+		diagnostic = udpDiagnostics.begin(key)
+		sender := newPacketSender(diagnostic)
 		if sniffingEnable && snifferDispatcher.Enable() {
 			return snifferDispatcher.UDPSniff(packet, sender)
 		}
 		return sender
 	})
 	if !loaded {
+		diagnostic.created()
+		stage := "sniff"
 		dial := func() (C.PacketConn, C.WriteBackProxy, error) {
 			originMetadata := metadata  // save origin metadata
 			metadata = metadata.Clone() // don't modify PacketAdapter's metadata
@@ -462,6 +466,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 
 			_ = preHandleMetadata(metadata) // error was pre-checked
 
+			stage = "route"
 			proxy, rule, err := resolveMetadata(metadata)
 			if err != nil {
 				log.Warnln("[UDP] Parse metadata failed: %s", err.Error())
@@ -471,6 +476,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 			dialMetadata := metadata.Pure()
 			ctx, cancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
 			defer cancel()
+			stage = "dial"
 			rawPc, err := retry(ctx, func(ctx context.Context) (C.PacketConn, error) {
 				return proxy.ListenPacketContext(ctx, dialMetadata)
 			}, func(err error) {
@@ -487,7 +493,8 @@ func handleUDPConn(packet C.PacketAdapter) {
 			oAddrPort := dialMetadata.AddrPort()
 			writeBackProxy := nat.NewWriteBackProxy(packet)
 
-			go handleUDPToLocal(writeBackProxy, pc, sender, key, oAddrPort)
+			diagnostic.ready(pc.ID())
+			go handleUDPToLocal(writeBackProxy, pc, sender, key, oAddrPort, diagnostic)
 			return pc, writeBackProxy, nil
 		}
 
@@ -495,6 +502,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 			pc, proxy, err := dial()
 			if err != nil {
 				sender.Close()
+				diagnostic.ended(stage, err)
 				natTable.Delete(key)
 				return
 			}
