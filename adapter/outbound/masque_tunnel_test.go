@@ -18,6 +18,7 @@ import (
 	"github.com/metacubex/mihomo/transport/masque"
 	"github.com/metacubex/mipstack"
 	"github.com/metacubex/quic-go/quicvarint"
+	D "github.com/miekg/dns"
 	"github.com/stretchr/testify/require"
 )
 
@@ -52,6 +53,34 @@ func masqueEchoTunnel(t *testing.T, option MasqueOption) *Masque {
 			}
 		}
 	}()
+	if option.RemoteDnsResolve {
+		dnsPackets, err := remote.ListenUDP(context.Background(), "udp4", netip.MustParseAddrPort("192.0.2.1:5354"))
+		require.NoError(t, err)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			buffer := make([]byte, 2048)
+			for {
+				n, address, err := dnsPackets.ReadFrom(buffer)
+				if err != nil {
+					return
+				}
+				query := new(D.Msg)
+				if query.Unpack(buffer[:n]) != nil {
+					continue
+				}
+				reply := new(D.Msg).SetReply(query)
+				if len(query.Question) > 0 && query.Question[0].Qtype == D.TypeA {
+					reply.Answer = []D.RR{&D.A{Hdr: D.RR_Header{Name: query.Question[0].Name, Rrtype: D.TypeA, Class: D.ClassINET, Ttl: 60}, A: net.ParseIP("192.0.2.1").To4()}}
+				}
+				data, err := reply.Pack()
+				if err == nil {
+					_, _ = dnsPackets.WriteTo(data, address)
+				}
+			}
+		}()
+		t.Cleanup(func() { _ = dnsPackets.Close(); <-done })
+	}
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodConnect || r.Header.Get("cf-connect-proto") != "cf-connect-ip" {
 			w.WriteHeader(http.StatusBadRequest)
@@ -121,15 +150,24 @@ func masqueEchoTunnel(t *testing.T, option MasqueOption) *Masque {
 func TestMasqueLazyStackCarriesTCPAndUDP(t *testing.T) {
 	base := masqueTestOption(t)
 	for _, mode := range masqueTestStackModes() {
-		for _, handshakeTimeout := range []int{0, 2} {
-			t.Run(fmt.Sprintf("%s/timeout-%d", mode, handshakeTimeout), func(t *testing.T) {
+		for _, settings := range []struct {
+			timeout   int
+			remoteDNS bool
+		}{{0, false}, {2, false}, {0, true}} {
+			t.Run(fmt.Sprintf("%s/timeout-%d/dns-%v", mode, settings.timeout, settings.remoteDNS), func(t *testing.T) {
 				option := base
-				option.IPStack.Mode, option.HandshakeTimeout = mode, handshakeTimeout
+				option.IPStack.Mode, option.HandshakeTimeout = mode, settings.timeout
+				option.RemoteDnsResolve, option.Dns = settings.remoteDNS, []string{"192.0.2.1:5354"}
+				option.UDP = true
 				node := masqueEchoTunnel(t, option)
 				require.Nil(t, node.tunDevice)
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				conn, err := node.DialContext(ctx, &C.Metadata{NetWork: C.TCP, DstIP: netip.MustParseAddr("192.0.2.1"), DstPort: 8080})
+				tcpTarget := &C.Metadata{NetWork: C.TCP, DstIP: netip.MustParseAddr("192.0.2.1"), DstPort: 8080}
+				if settings.remoteDNS {
+					tcpTarget.DstIP, tcpTarget.Host = netip.Addr{}, "echo.test"
+				}
+				conn, err := node.DialContext(ctx, tcpTarget)
 				require.NoError(t, err)
 				defer conn.Close()
 				require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
@@ -141,7 +179,11 @@ func TestMasqueLazyStackCarriesTCPAndUDP(t *testing.T) {
 				require.Equal(t, "tcp echo", string(buf))
 
 				device := node.tunDevice
-				pc, err := node.ListenPacketContext(ctx, &C.Metadata{NetWork: C.UDP, DstIP: netip.MustParseAddr("192.0.2.1"), DstPort: 5353})
+				udpTarget := &C.Metadata{NetWork: C.UDP, DstIP: netip.MustParseAddr("192.0.2.1"), DstPort: 5353}
+				if settings.remoteDNS {
+					udpTarget.DstIP, udpTarget.Host = netip.Addr{}, "echo.test"
+				}
+				pc, err := node.ListenPacketContext(ctx, udpTarget)
 				require.NoError(t, err)
 				defer pc.Close()
 				require.Same(t, device, node.tunDevice)

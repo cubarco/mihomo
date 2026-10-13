@@ -19,7 +19,6 @@ import (
 	"github.com/metacubex/mihomo/common/contextutils"
 	"github.com/metacubex/mihomo/common/pool"
 	"github.com/metacubex/mihomo/component/dialer"
-	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/log"
@@ -37,7 +36,7 @@ type Masque struct {
 	tlsConfig   *tls.Config
 	quicConfig  *quic.Config
 	tunDevice   ipStack
-	resolver    resolver.Resolver
+	resolver    *nodeDNS
 	uri         string
 	h2Transport *http.Transport
 	l4Client    *masque.L4Client
@@ -269,10 +268,7 @@ func NewMasque(option MasqueOption) (_ *Masque, resultErr error) {
 		for i := range nss {
 			nss[i].ProxyAdapter = outbound
 		}
-		outbound.resolver = dns.NewResolver(dns.Config{
-			Main: nss,
-			IPv6: has6,
-		})
+		outbound.resolver = &nodeDNS{servers: nss, ipv6: has6}
 	}
 
 	return outbound, nil
@@ -441,6 +437,7 @@ func (w *Masque) startLocked(ctx context.Context) error {
 func (w *Masque) Close() error {
 	w.closeOnce.Do(func() {
 		w.runCancel()
+		w.resolver.close()
 		w.deviceMutex.Lock()
 		if w.tunDevice != nil {
 			_ = w.tunDevice.Close()
@@ -459,9 +456,9 @@ func (w *Masque) Close() error {
 func (w *Masque) dialContextL4(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
 	var conn net.Conn
 	if !metadata.Resolved() || w.resolver != nil {
-		r := resolver.DefaultResolver
-		if w.resolver != nil {
-			r = w.resolver
+		r, resolveErr := w.resolver.get(ctx)
+		if resolveErr != nil {
+			return nil, resolveErr
 		}
 		options := w.DialOptions()
 		options = append(options, dialer.WithResolver(r))
@@ -488,9 +485,9 @@ func (w *Masque) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Con
 		return nil, err
 	}
 	if !metadata.Resolved() || w.resolver != nil {
-		r := resolver.DefaultResolver
-		if w.resolver != nil {
-			r = w.resolver
+		r, resolveErr := w.resolver.get(ctx)
+		if resolveErr != nil {
+			return nil, resolveErr
 		}
 		options := w.DialOptions()
 		options = append(options, dialer.WithResolver(r))
@@ -532,9 +529,9 @@ func (w *Masque) ListenPacketContext(ctx context.Context, metadata *C.Metadata) 
 
 func (w *Masque) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
 	if (!metadata.Resolved() || w.resolver != nil) && metadata.Host != "" {
-		r := resolver.DefaultResolver
-		if w.resolver != nil {
-			r = w.resolver
+		r, err := w.resolver.get(ctx)
+		if err != nil {
+			return err
 		}
 		ip, err := resolveIPWithResolver(ctx, metadata.Host, w.prefer, r)
 		if err != nil {

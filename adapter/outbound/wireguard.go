@@ -17,7 +17,6 @@ import (
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/proxydialer"
-	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/slowdown"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/constant/features"
@@ -52,7 +51,7 @@ type WireGuard struct {
 	bind      *wireguard.ClientBind
 	device    wireguardGoDevice
 	tunDevice wireguardDevice
-	resolver  resolver.Resolver
+	resolver  *nodeDNS
 
 	runCtx        context.Context
 	runCancel     context.CancelFunc
@@ -495,10 +494,7 @@ func NewWireGuard(option WireGuardOption) (_ *WireGuard, resultErr error) {
 		for i := range nss {
 			nss[i].ProxyAdapter = outbound
 		}
-		outbound.resolver = dns.NewResolver(dns.Config{
-			Main: nss,
-			IPv6: has6,
-		})
+		outbound.resolver = &nodeDNS{servers: nss, ipv6: has6}
 	}
 
 	return outbound, nil
@@ -817,6 +813,7 @@ func (w *WireGuard) genIpcConf(ctx context.Context, updateOnly bool) (string, er
 // Close implements C.ProxyAdapter
 func (w *WireGuard) Close() error {
 	w.runCancel()
+	w.resolver.close()
 	w.deviceMutex.Lock()
 	wgDevice := w.device
 	w.deviceMutex.Unlock()
@@ -832,9 +829,9 @@ func (w *WireGuard) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.
 		return nil, err
 	}
 	if !metadata.Resolved() || w.resolver != nil {
-		r := resolver.DefaultResolver
-		if w.resolver != nil {
-			r = w.resolver
+		r, resolveErr := w.resolver.get(ctx)
+		if resolveErr != nil {
+			return nil, resolveErr
 		}
 		options := w.DialOptions()
 		options = append(options, dialer.WithResolver(r))
@@ -873,9 +870,9 @@ func (w *WireGuard) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 
 func (w *WireGuard) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
 	if (!metadata.Resolved() || w.resolver != nil) && metadata.Host != "" {
-		r := resolver.DefaultResolver
-		if w.resolver != nil {
-			r = w.resolver
+		r, err := w.resolver.get(ctx)
+		if err != nil {
+			return err
 		}
 		ip, err := resolveIPWithResolver(ctx, metadata.Host, w.prefer, r)
 		if err != nil {
