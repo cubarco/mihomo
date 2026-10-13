@@ -54,11 +54,12 @@ func NewTLSKeyPairLoader(certificate, privateKey string) (func() (*tls.Certifica
 	}
 	gcFlag := new(os.File) // tiny (on the order of 16 bytes or less) and pointer-free objects may never run the finalizer, so we choose new an os.File
 	updateMutex := sync.RWMutex{}
+	currentCert := &cert
 	if watcher, err := fswatch.NewWatcher(fswatch.Options{Path: []string{certificate, privateKey}, Callback: func(path string) {
 		updateMutex.Lock()
 		defer updateMutex.Unlock()
 		if newCert, err := tls.LoadX509KeyPair(certificate, privateKey); err == nil {
-			cert = newCert
+			currentCert = &newCert
 		}
 	}}); err == nil {
 		if err = watcher.Start(); err == nil {
@@ -71,7 +72,7 @@ func NewTLSKeyPairLoader(certificate, privateKey string) (func() (*tls.Certifica
 		defer runtime.KeepAlive(gcFlag)
 		updateMutex.RLock()
 		defer updateMutex.RUnlock()
-		return &cert, nil
+		return currentCert, nil
 	}, nil
 }
 

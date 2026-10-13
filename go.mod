@@ -169,3 +169,6 @@ replace github.com/metacubex/mipstack => ./third_party/mipstack
 
 // Keep the mips TUN socket buffer profile (see sing-tun README.oix.md).
 replace github.com/metacubex/sing-tun => ./third_party/sing-tun
+
+// Release the watcher when adding a path fails (see fswatch README.oix.md).
+replace github.com/metacubex/fswatch => ./third_party/fswatch
