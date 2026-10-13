@@ -72,11 +72,7 @@ func SetHealthCheckPriority(priority func() map[string]struct{}) {
 	healthCheckPriority.Store(priority)
 }
 
-func prioritizeHealthChecks(proxies []C.Proxy, url string) []C.Proxy {
-	var selected map[string]struct{}
-	if priority := healthCheckPriority.Load(); priority != nil {
-		selected = priority()
-	}
+func prioritizeHealthChecks(proxies []C.Proxy, url string, selected map[string]struct{}) []C.Proxy {
 	var buckets [3][]C.Proxy
 	for _, proxy := range proxies {
 		_, chosen := selected[proxy.Name()]

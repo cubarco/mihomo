@@ -27,6 +27,14 @@ type extraOption struct {
 	filters        map[string]struct{}
 }
 
+type healthCheckMode uint8
+
+const (
+	healthCheckManual healthCheckMode = iota
+	healthCheckScheduled
+	healthCheckRecovery
+)
+
 type HealthCheck struct {
 	ctx            context.Context
 	ctxCancel      context.CancelFunc
@@ -40,7 +48,10 @@ type HealthCheck struct {
 	lastTouch      atomic.TypedValue[time.Time]
 	singleDo       *singledo.Single[struct{}]
 	scheduledDo    *singledo.Single[struct{}]
+	recoveryDo     *singledo.Single[struct{}]
 	timeout        time.Duration
+	windowMu       sync.Mutex
+	windowNext     map[string]int
 }
 
 func (hc *HealthCheck) process() {
@@ -143,10 +154,14 @@ func (hc *HealthCheck) touch() {
 }
 
 func (hc *HealthCheck) check() {
-	hc.checkWithContext(hc.ctx, false)
+	hc.checkWithContext(hc.ctx, healthCheckManual)
 }
 
 func (hc *HealthCheck) checkScheduled() {
+	hc.checkBackground(healthCheckScheduled)
+}
+
+func (hc *HealthCheck) checkBackground(mode healthCheckMode) {
 	paused, active, _ := backgroundHealthChecks.state()
 	if paused || active.Err() != nil {
 		return
@@ -158,39 +173,48 @@ func (hc *HealthCheck) checkScheduled() {
 	if active.Err() != nil {
 		return
 	}
-	hc.checkWithContext(adapter.WithBackgroundURLTest(ctx), true)
+	hc.checkWithContext(adapter.WithBackgroundURLTest(ctx), mode)
 }
 
-func (hc *HealthCheck) checkWithContext(ctx context.Context, scheduled bool) {
+func (hc *HealthCheck) checkWithContext(ctx context.Context, mode healthCheckMode) {
 	if healthCheckSuspended.Load() || ctx.Err() != nil {
 		return
 	}
 	hc.mu.Lock()
-	proxies := append([]C.Proxy(nil), hc.proxies...)
-	extra := make(map[string]*extraOption, len(hc.extra))
-	for url, option := range hc.extra {
-		filters := make(map[string]struct{}, len(option.filters))
-		for filter := range option.filters {
-			filters[filter] = struct{}{}
-		}
-		extra[url] = &extraOption{
-			expectedStatus: option.expectedStatus,
-			filters:        filters,
-		}
-	}
-	url := hc.url
-	expectedStatus := hc.expectedStatus
+	empty := len(hc.proxies) == 0
 	hc.mu.Unlock()
-	if len(proxies) == 0 {
+	if empty {
 		return
 	}
-
 	singleDo := hc.singleDo
-	if scheduled {
+	switch mode {
+	case healthCheckScheduled:
 		singleDo = hc.scheduledDo
+	case healthCheckRecovery:
+		singleDo = hc.recoveryDo
 	}
 	_, _, _ = singleDo.Do(func() (struct{}, error) {
 		if healthCheckSuspended.Load() || ctx.Err() != nil {
+			return struct{}{}, nil
+		}
+		hc.mu.Lock()
+		// Constructor and replacement own their slices; published slices stay immutable.
+		proxies := hc.proxies
+		extra := make(map[string]*extraOption, len(hc.extra))
+		for url, option := range hc.extra {
+			filters := make(map[string]struct{}, len(option.filters))
+			for filter := range option.filters {
+				filters[filter] = struct{}{}
+			}
+			extra[url] = &extraOption{
+				expectedStatus: option.expectedStatus,
+				filters:        filters,
+			}
+		}
+		url := hc.url
+		expectedStatus := hc.expectedStatus
+		hc.mu.Unlock()
+		if len(proxies) == 0 {
 			return struct{}{}, nil
 		}
 		id := utils.NewUUIDV4().String()
@@ -198,28 +222,47 @@ func (hc *HealthCheck) checkWithContext(ctx context.Context, scheduled bool) {
 		b := new(errgroup.Group)
 		b.SetLimit(10)
 		began := time.Now()
+		nextWindows := make(map[string]int)
+		execute := func(url string, option *extraOption) {
+			if next := hc.execute(ctx, b, proxies, url, id, option, mode, began); next >= 0 {
+				nextWindows[strings.TrimSpace(url)] = next
+			}
+		}
 
 		// execute default health check
 		option := &extraOption{filters: nil, expectedStatus: expectedStatus}
-		hc.execute(ctx, b, proxies, url, id, option, scheduled, began)
+		execute(url, option)
 
 		// execute extra health check
 		if len(extra) != 0 {
 			for url, option := range extra {
-				hc.execute(ctx, b, proxies, url, id, option, scheduled, began)
+				execute(url, option)
 			}
 		}
 		_ = b.Wait()
+		if ctx.Err() == nil && len(nextWindows) != 0 {
+			hc.windowMu.Lock()
+			if hc.windowNext == nil {
+				hc.windowNext = make(map[string]int)
+			}
+			for url, next := range nextWindows {
+				hc.windowNext[url] = next
+			}
+			hc.windowMu.Unlock()
+		}
 		log.Debugln("Finish A Health Checking {%s}", id)
 		return struct{}{}, nil
 	})
 }
 
-func (hc *HealthCheck) execute(ctx context.Context, b *errgroup.Group, proxies []C.Proxy, url, uid string, option *extraOption, scheduled bool, began time.Time) {
+func (hc *HealthCheck) execute(ctx context.Context, b *errgroup.Group, proxies []C.Proxy, url, uid string, option *extraOption, mode healthCheckMode, began time.Time) int {
+	if ctx.Err() != nil {
+		return -1
+	}
 	url = strings.TrimSpace(url)
 	if len(url) == 0 {
 		log.Debugln("Health Check has been skipped due to testUrl is empty, {%s}", uid)
-		return
+		return -1
 	}
 
 	var filterReg *regexp2.Regexp
@@ -236,25 +279,42 @@ func (hc *HealthCheck) execute(ctx context.Context, b *errgroup.Group, proxies [
 			filterReg, err = utils.CompileNameRegex(strings.Join(filters, "|"))
 			if err != nil {
 				log.Errorln("Health check filter is invalid: %v", err)
-				return
+				return -1
 			}
 		}
 	}
 
-	if scheduled {
-		proxies = prioritizeHealthChecks(proxies, url)
+	background := mode != healthCheckManual
+	var selected map[string]struct{}
+	if priority := healthCheckPriority.Load(); background && priority != nil {
+		selected = priority()
+	}
+	nextWindow := -1
+	if mode == healthCheckScheduled && len(proxies) > healthCheckWindowSize {
+		var err error
+		proxies, nextWindow, err = hc.window(ctx, proxies, url, filterReg, selected)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Errorln("Health check filter evaluation failed: %v", err)
+			}
+			return -1
+		}
+		filterReg = nil
+	}
+	if background {
+		proxies = prioritizeHealthChecks(proxies, url, selected)
 	}
 	expected := expectedStatus.String()
 	for _, proxy := range proxies {
 		if ctx.Err() != nil {
-			return
+			return -1
 		}
 		// skip proxies that do not require health check
 		if filterReg != nil {
 			match, err := filterReg.MatchString(proxy.Name())
 			if err != nil {
 				log.Errorln("Health check filter evaluation failed: %v", err)
-				return
+				return -1
 			}
 			if !match {
 				continue
@@ -262,9 +322,9 @@ func (hc *HealthCheck) execute(ctx context.Context, b *errgroup.Group, proxies [
 		}
 
 		p := proxy
-		if scheduled {
+		if background {
 			if err := backgroundHealthChecks.slots.Acquire(ctx, 1); err != nil {
-				return
+				return -1
 			}
 			if ctx.Err() != nil || measuredInHealthCheckRound(p, url, expected, hc.timeout, began) {
 				backgroundHealthChecks.slots.Release(1)
@@ -272,7 +332,7 @@ func (hc *HealthCheck) execute(ctx context.Context, b *errgroup.Group, proxies [
 			}
 		}
 		b.Go(func() error {
-			if scheduled {
+			if background {
 				defer backgroundHealthChecks.slots.Release(1)
 			}
 			if ctx.Err() != nil {
@@ -287,6 +347,7 @@ func (hc *HealthCheck) execute(ctx context.Context, b *errgroup.Group, proxies [
 			return nil
 		})
 	}
+	return nextWindow
 }
 
 func (hc *HealthCheck) close() {
@@ -306,7 +367,7 @@ func NewHealthCheck(proxies []C.Proxy, url string, timeout uint, interval uint, 
 	return &HealthCheck{
 		ctx:            ctx,
 		ctxCancel:      cancel,
-		proxies:        proxies,
+		proxies:        append([]C.Proxy(nil), proxies...),
 		url:            url,
 		timeout:        time.Duration(timeout) * time.Millisecond,
 		extra:          map[string]*extraOption{},
@@ -315,5 +376,6 @@ func NewHealthCheck(proxies []C.Proxy, url string, timeout uint, interval uint, 
 		expectedStatus: expectedStatus,
 		singleDo:       singledo.NewSingle[struct{}](time.Second),
 		scheduledDo:    singledo.NewSingle[struct{}](time.Second),
+		recoveryDo:     singledo.NewSingle[struct{}](time.Second),
 	}
 }

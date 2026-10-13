@@ -74,7 +74,7 @@ func (bp *baseProvider) HealthCheck() {
 }
 
 func (bp *baseProvider) HealthCheckBackground() {
-	bp.healthCheck.checkScheduled()
+	bp.healthCheck.checkBackground(healthCheckRecovery)
 }
 
 func (bp *baseProvider) Type() P.ProviderType {
