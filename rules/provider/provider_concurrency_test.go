@@ -10,6 +10,7 @@ import (
 	"github.com/metacubex/mihomo/component/resource"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
+	"github.com/metacubex/mihomo/rules/common"
 )
 
 type concurrentRuleTunnel struct {
@@ -22,15 +23,35 @@ func (t *concurrentRuleTunnel) RuleUpdateCallback() *utils.Callback[P.RuleProvid
 	return &t.callback
 }
 func TestRuleStrategyConcurrentUpdate(t *testing.T) {
+	for _, behavior := range []P.RuleBehavior{P.Domain, P.Classical} {
+		t.Run(behavior.String(), func(t *testing.T) { testRuleStrategyConcurrentUpdate(t, behavior) })
+	}
+}
+
+func testRuleStrategyConcurrentUpdate(t *testing.T, behavior P.RuleBehavior) {
 	previous := tunnel
 	SetTunnel(&concurrentRuleTunnel{})
 	defer SetTunnel(previous)
-	p := NewRuleSetProvider("test", P.Domain, P.YamlRule, 0, resource.NewFileVehicle(filepath.Join(t.TempDir(), "rules.yaml")), nil, nil, nil).(*RuleSetProvider)
+	parse := func(tp, payload, target string, _ []string, _ map[string][]C.Rule) (C.Rule, error) {
+		if tp != "DOMAIN" {
+			return nil, fmt.Errorf("unexpected rule type: %s", tp)
+		}
+		return common.NewDomain(payload, target), nil
+	}
+	p := NewRuleSetProvider("test", behavior, P.YamlRule, 0, resource.NewFileVehicle(filepath.Join(t.TempDir(), "rules.yaml")), nil, nil, parse).(*RuleSetProvider)
 	defer p.Close()
 	var group sync.WaitGroup
 	group.Go(func() {
 		for index := range 100 {
-			_, _, err := p.SideUpdate([]byte(fmt.Sprintf("payload:\n  - '%d.example.com'\n", index)))
+			data := []byte("payload:\n")
+			prefix := ""
+			if behavior == P.Classical {
+				prefix = "DOMAIN,"
+			}
+			for rule := range 32 {
+				data = fmt.Appendf(data, "  - '%s%d-%d.example.com'\n", prefix, index, rule)
+			}
+			_, _, err := p.SideUpdate(data)
 			if err != nil {
 				t.Error(err)
 			}
@@ -39,12 +60,12 @@ func TestRuleStrategyConcurrentUpdate(t *testing.T) {
 	group.Go(func() {
 		for range 1000 {
 			_ = p.Count()
-			_ = p.Match(&C.Metadata{Host: "1.example.com"}, C.RuleMatchHelper{})
+			_ = p.Match(&C.Metadata{Host: "1-0.example.com"}, C.RuleMatchHelper{})
 			_, _ = p.MarshalJSON()
 		}
 	})
 	group.Wait()
-	if p.Count() != 1 || !p.Match(&C.Metadata{Host: "99.example.com"}, C.RuleMatchHelper{}) {
+	if p.Count() != 32 || !p.Match(&C.Metadata{Host: "99-0.example.com"}, C.RuleMatchHelper{}) || p.Match(&C.Metadata{Host: "98-0.example.com"}, C.RuleMatchHelper{}) {
 		t.Fatal("last update was not published")
 	}
 }

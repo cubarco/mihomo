@@ -10,9 +10,13 @@ import (
 )
 
 type classicalStrategy struct {
-	rules []C.Rule
+	rules []classicalMatcher
 	count int
 	parse common.ParseRuleFunc
+}
+
+type classicalMatcher interface {
+	Match(*C.Metadata, C.RuleMatchHelper) (bool, string)
 }
 
 func (c *classicalStrategy) Behavior() P.RuleBehavior {
@@ -57,8 +61,36 @@ func (c *classicalStrategy) payloadToRule(rule string) (C.Rule, error) {
 	return c.parse(tp, payload, target, params, nil)
 }
 
-func (c *classicalStrategy) FinishInsert() {}
+func (c *classicalStrategy) FinishInsert() {
+	kept := 0
+	for start := 0; start < len(c.rules); {
+		end := start
+		for end < len(c.rules) && isClassicalDomain(c.rules[end]) {
+			end++
+		}
+		if end-start >= minClassicalDomainRun {
+			c.rules[kept] = newClassicalDomainRun(c.rules[start:end])
+			kept++
+			start = end
+			continue
+		}
+		if end == start {
+			end++
+		}
+		kept += copy(c.rules[kept:], c.rules[start:end])
+		start = end
+	}
+	if kept == len(c.rules) {
+		return
+	}
+	clear(c.rules[kept:])
+	if kept < cap(c.rules)/2 {
+		c.rules = append([]classicalMatcher(nil), c.rules[:kept]...)
+	} else {
+		c.rules = c.rules[:kept]
+	}
+}
 
 func NewClassicalStrategy(parse common.ParseRuleFunc) *classicalStrategy {
-	return &classicalStrategy{rules: []C.Rule{}, parse: parse}
+	return &classicalStrategy{parse: parse}
 }
