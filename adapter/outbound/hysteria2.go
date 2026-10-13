@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"strconv"
+	"sync"
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
@@ -32,8 +34,43 @@ const defaultHopInterval = 30
 type Hysteria2 struct {
 	*Base
 
-	option *Hysteria2Option
-	client *hysteria2.Client
+	option         *Hysteria2Option
+	clientMu       sync.Mutex
+	client         *hysteria2.Client
+	clientErr      error
+	buildClient    func() (*hysteria2.Client, error)
+	closed         bool
+	runCtx         context.Context
+	runCancel      context.CancelFunc
+	realmTransport *http.Transport
+}
+
+func (h *Hysteria2) lazyClient(ctx context.Context) (*hysteria2.Client, error) {
+	h.clientMu.Lock()
+	defer h.clientMu.Unlock()
+	if h.closed {
+		return nil, net.ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if h.buildClient != nil {
+		h.client, h.clientErr = h.buildClient()
+		h.buildClient = nil
+	}
+	return h.client, h.clientErr
+}
+
+func (h *Hysteria2) requestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(h.runCtx, cancel)
+	if h.runCtx.Err() != nil {
+		cancel()
+	}
+	return ctx, func() {
+		stop()
+		cancel()
+	}
 }
 
 type Hysteria2Option struct {
@@ -90,7 +127,13 @@ type Hysteria2RealmOption struct {
 }
 
 func (h *Hysteria2) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
-	c, err := h.client.DialConn(ctx, M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
+	client, err := h.lazyClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := h.requestContext(ctx)
+	defer cancel()
+	c, err := client.DialConn(ctx, M.ParseSocksaddrHostPort(metadata.String(), metadata.DstPort))
 	if err != nil {
 		return nil, err
 	}
@@ -98,10 +141,16 @@ func (h *Hysteria2) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.
 }
 
 func (h *Hysteria2) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
+	client, err := h.lazyClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := h.requestContext(ctx)
+	defer cancel()
 	if err = h.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
-	pc, err := h.client.ListenPacket(ctx)
+	pc, err := client.ListenPacket(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -113,8 +162,22 @@ func (h *Hysteria2) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 
 // Close implements C.ProxyAdapter
 func (h *Hysteria2) Close() error {
-	if h.client != nil {
-		return h.client.CloseWithError(errors.New("proxy removed"))
+	h.clientMu.Lock()
+	if h.closed {
+		h.clientMu.Unlock()
+		return nil
+	}
+	h.closed = true
+	client := h.client
+	h.client = nil
+	h.buildClient = nil
+	h.clientMu.Unlock()
+	h.runCancel()
+	if h.realmTransport != nil {
+		h.realmTransport.CloseIdleConnections()
+	}
+	if client != nil {
+		return client.CloseWithError(net.ErrClosed)
 	}
 	return nil
 }
@@ -183,7 +246,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 	}
 
 	if option.ALPN != nil { // structure's Decode will ensure value not nil when input has value even it was set an empty array
-		tlsConfig.NextProtos = option.ALPN
+		tlsConfig.NextProtos = slices.Clone(option.ALPN)
 	}
 
 	tlsClientConfig := tlsConfig
@@ -234,17 +297,13 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 		HandshakeTimeout: time.Duration(option.HandshakeTimeout) * time.Second,
 	}
 
-	var serverPorts []uint16
+	var portRanges utils.IntRanges[uint16]
 	if option.Ports != "" {
-		ranges, err := utils.NewUnsignedRanges[uint16](option.Ports)
+		portRanges, err = utils.NewUnsignedRanges[uint16](option.Ports)
 		if err != nil {
 			return nil, err
 		}
-		ranges.Range(func(port uint16) bool {
-			serverPorts = append(serverPorts, port)
-			return true
-		})
-		if len(serverPorts) > 0 {
+		if len(portRanges) > 0 {
 			hopRange, err := utils.NewUnsignedRange[uint64](option.HopInterval)
 			if err != nil {
 				return nil, err
@@ -260,10 +319,9 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 			}
 			clientOptions.HopInterval = time.Duration(start) * time.Second
 			clientOptions.HopIntervalMax = time.Duration(end) * time.Second
-			clientOptions.ServerPorts = serverPorts
 		}
 	}
-	if option.Port == 0 && len(serverPorts) == 0 {
+	if option.Port == 0 && len(portRanges) == 0 {
 		return nil, errors.New("invalid port")
 	}
 
@@ -272,7 +330,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 			TLSConfig: &tls.Config{
 				ServerName:         option.RealmOpts.SNI,
 				InsecureSkipVerify: option.RealmOpts.SkipCertVerify,
-				NextProtos:         option.RealmOpts.ALPN,
+				NextProtos:         slices.Clone(option.RealmOpts.ALPN),
 			},
 			Fingerprint:    option.RealmOpts.Fingerprint,
 			NameCertVerify: option.RealmOpts.NameCertVerify,
@@ -282,23 +340,22 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 		if err != nil {
 			return nil, err
 		}
+		outbound.realmTransport = &http.Transport{
+			DialContext:     outbound.dialer.DialContext,
+			TLSClientConfig: httpTLSClientConfig,
+			// from http.DefaultTransport
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
 		clientOptions.RealmOptions = &realm.Options{
 			ServerURL:   option.RealmOpts.ServerURL,
 			Token:       option.RealmOpts.Token,
 			RealmID:     option.RealmOpts.RealmID,
-			STUNServers: option.RealmOpts.STUNServers,
-			HTTPClient: &http.Client{
-				Transport: &http.Transport{
-					DialContext:     outbound.dialer.DialContext,
-					TLSClientConfig: httpTLSClientConfig,
-					// from http.DefaultTransport
-					ForceAttemptHTTP2:     true,
-					MaxIdleConns:          100,
-					IdleConnTimeout:       90 * time.Second,
-					TLSHandshakeTimeout:   10 * time.Second,
-					ExpectContinueTimeout: 1 * time.Second,
-				},
-			},
+			STUNServers: slices.Clone(option.RealmOpts.STUNServers),
+			HTTPClient:  &http.Client{Transport: outbound.realmTransport},
 			Resolver: func(ctx context.Context, host string, ipv4, ipv6 bool) ([]netip.Addr, error) {
 				if ipv4 && !ipv6 {
 					return resolver.LookupIPv4WithResolver(ctx, host, resolver.ProxyServerHostResolver)
@@ -311,11 +368,44 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 		}
 	}
 
-	client, err := hysteria2.NewClient(clientOptions)
+	// Validate through the dependency without expanding the full hopping range.
+	outbound.runCtx, outbound.runCancel = context.WithCancel(context.Background())
+	clientOptions.Context = outbound.runCtx
+	validationOptions := clientOptions
+	if len(portRanges) > 0 {
+		validationOptions.ServerPorts = []uint16{portRanges[0].Start()}
+	}
+	probe, err := hysteria2.NewClient(validationOptions)
 	if err != nil {
+		outbound.runCancel()
 		return nil, err
 	}
-	outbound.client = client
+	if len(portRanges) == 0 {
+		outbound.client = probe
+	} else {
+		_ = probe.CloseWithError(net.ErrClosed)
+		preparedOptions := clientOptions
+		outbound.buildClient = func() (*hysteria2.Client, error) {
+			preparedOptions.ServerPorts = expandHysteria2Ports(portRanges)
+			return hysteria2.NewClient(preparedOptions)
+		}
+	}
 
 	return outbound, nil
+}
+
+func expandHysteria2Ports(ranges utils.IntRanges[uint16]) []uint16 {
+	if len(ranges) == 0 {
+		return nil
+	}
+	count := 0
+	for _, r := range ranges {
+		count += int(r.End()) - int(r.Start()) + 1
+	}
+	ports := make([]uint16, 0, count)
+	ranges.Range(func(port uint16) bool {
+		ports = append(ports, port)
+		return true
+	})
+	return ports
 }
