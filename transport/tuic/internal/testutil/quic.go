@@ -37,9 +37,13 @@ func TLSConfigs(t testing.TB) (server, client *tls.Config) {
 }
 
 func StreamLimitedConn(t testing.TB) *quic.Conn {
+	return ConnectedQUIC(t, -1)
+}
+
+func ConnectedQUIC(t testing.TB, maxStreams int64) *quic.Conn {
 	t.Helper()
 	serverTLS, clientTLS := TLSConfigs(t)
-	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, &quic.Config{MaxIncomingStreams: -1})
+	listener, err := quic.ListenAddr("127.0.0.1:0", serverTLS, &quic.Config{MaxIncomingStreams: maxStreams})
 	if err != nil {
 		t.Fatal(err)
 	}

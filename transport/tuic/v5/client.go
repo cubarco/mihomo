@@ -17,6 +17,7 @@ import (
 	"github.com/metacubex/mihomo/common/xsync"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
+	"github.com/metacubex/mihomo/transport/tuic/common"
 	"github.com/metacubex/mihomo/transport/tuic/types"
 
 	"github.com/metacubex/quic-go"
@@ -31,25 +32,30 @@ type ClientOption struct {
 	MaxOpenStreams        int64
 }
 
+type clientSession struct {
+	conn        *quic.Conn
+	openStreams atomic.Int64
+	udpInputMap xsync.Map[uint16, net.Conn]
+}
+
 type clientImpl struct {
 	*ClientOption
 	dialFn types.DialFunc
 	udp    bool
 
-	quicConn  *quic.Conn
+	session   atomic.Pointer[clientSession]
 	connMutex sync.Mutex
-
-	openStreams atomic.Int64
-	closed      atomic.Bool
-
-	udpInputMap xsync.Map[uint16, net.Conn]
+	closed    atomic.Bool
 
 	// only ready for PoolClient
 	lastVisited atomic2.TypedValue[time.Time]
 }
 
 func (t *clientImpl) OpenStreams() int64 {
-	return t.openStreams.Load()
+	if session := t.session.Load(); session != nil {
+		return session.openStreams.Load()
+	}
+	return 0
 }
 
 func (t *clientImpl) LastVisited() time.Time {
@@ -60,41 +66,38 @@ func (t *clientImpl) SetLastVisited(last time.Time) {
 	t.lastVisited.Store(last)
 }
 
-func (t *clientImpl) getQuicConn(ctx context.Context) (*quic.Conn, error) {
+func (t *clientImpl) getSession(ctx context.Context) (*clientSession, error) {
 	t.connMutex.Lock()
 	defer t.connMutex.Unlock()
 	if t.closed.Load() {
 		return nil, types.ClientClosed
 	}
-	if t.quicConn != nil {
-		return t.quicConn, nil
+	session := t.session.Load()
+	if session == nil {
+		quicConn, err := t.dialFn(ctx)
+		if err != nil {
+			return nil, err
+		}
+		session = &clientSession{conn: quicConn}
+		t.session.Store(session)
+		go func() { _ = t.sendAuthentication(session) }()
+		if t.udp && t.UdpRelayMode == types.QUIC {
+			go func() { _ = t.handleUniStream(session) }()
+		}
+		// TCP sessions also receive v5 heartbeat datagrams.
+		go func() { _ = t.handleMessage(session) }()
 	}
-	quicConn, err := t.dialFn(ctx)
-	if err != nil {
-		return nil, err
+	if session.openStreams.Add(1) >= t.MaxOpenStreams {
+		session.openStreams.Add(-1)
+		return nil, types.TooManyOpenStreams
 	}
-
-	go func() {
-		_ = t.sendAuthentication(quicConn)
-	}()
-
-	if t.udp && t.UdpRelayMode == types.QUIC {
-		go func() {
-			_ = t.handleUniStream(quicConn)
-		}()
-	}
-	go func() {
-		_ = t.handleMessage(quicConn) // always handleMessage because tuicV5 using datagram to send the Heartbeat
-	}()
-
-	t.quicConn = quicConn
-	t.openStreams.Store(0)
-	return quicConn, nil
+	return session, nil
 }
 
-func (t *clientImpl) sendAuthentication(quicConn *quic.Conn) (err error) {
+func (t *clientImpl) sendAuthentication(session *clientSession) (err error) {
+	quicConn := session.conn
 	defer func() {
-		t.deferQuicConn(quicConn, err)
+		t.deferSession(session, err)
 	}()
 	stream, err := quicConn.OpenUniStream()
 	if err != nil {
@@ -121,9 +124,10 @@ func (t *clientImpl) sendAuthentication(quicConn *quic.Conn) (err error) {
 	return nil
 }
 
-func (t *clientImpl) handleUniStream(quicConn *quic.Conn) (err error) {
+func (t *clientImpl) handleUniStream(session *clientSession) (err error) {
+	quicConn := session.conn
 	defer func() {
-		t.deferQuicConn(quicConn, err)
+		t.deferSession(session, err)
 	}()
 	for {
 		var stream *quic.ReceiveStream
@@ -134,9 +138,9 @@ func (t *clientImpl) handleUniStream(quicConn *quic.Conn) (err error) {
 		go func() (err error) {
 			var assocId uint16
 			defer func() {
-				t.deferQuicConn(quicConn, err)
+				t.deferSession(session, err)
 				if err != nil && assocId != 0 {
-					if val, ok := t.udpInputMap.LoadAndDelete(assocId); ok {
+					if val, ok := session.udpInputMap.LoadAndDelete(assocId); ok {
 						if conn, ok := val.(net.Conn); ok {
 							_ = conn.Close()
 						}
@@ -158,7 +162,7 @@ func (t *clientImpl) handleUniStream(quicConn *quic.Conn) (err error) {
 				}
 				if t.udp && t.UdpRelayMode == types.QUIC {
 					assocId = packet.ASSOC_ID
-					if val, ok := t.udpInputMap.Load(assocId); ok {
+					if val, ok := session.udpInputMap.Load(assocId); ok {
 						if conn, ok := val.(net.Conn); ok {
 							writer := bufio.NewWriterSize(conn, packet.BytesLen())
 							_ = packet.WriteTo(writer)
@@ -172,9 +176,10 @@ func (t *clientImpl) handleUniStream(quicConn *quic.Conn) (err error) {
 	}
 }
 
-func (t *clientImpl) handleMessage(quicConn *quic.Conn) (err error) {
+func (t *clientImpl) handleMessage(session *clientSession) (err error) {
+	quicConn := session.conn
 	defer func() {
-		t.deferQuicConn(quicConn, err)
+		t.deferSession(session, err)
 	}()
 	for {
 		var message []byte
@@ -185,9 +190,9 @@ func (t *clientImpl) handleMessage(quicConn *quic.Conn) (err error) {
 		go func() (err error) {
 			var assocId uint16
 			defer func() {
-				t.deferQuicConn(quicConn, err)
+				t.deferSession(session, err)
 				if err != nil && assocId != 0 {
-					if val, ok := t.udpInputMap.LoadAndDelete(assocId); ok {
+					if val, ok := session.udpInputMap.LoadAndDelete(assocId); ok {
 						if conn, ok := val.(net.Conn); ok {
 							_ = conn.Close()
 						}
@@ -208,7 +213,7 @@ func (t *clientImpl) handleMessage(quicConn *quic.Conn) (err error) {
 				}
 				if t.udp && t.UdpRelayMode == types.NATIVE {
 					assocId = packet.ASSOC_ID
-					if val, ok := t.udpInputMap.Load(assocId); ok {
+					if val, ok := session.udpInputMap.Load(assocId); ok {
 						if conn, ok := val.(net.Conn); ok {
 							_, _ = conn.Write(message)
 						}
@@ -227,71 +232,72 @@ func (t *clientImpl) handleMessage(quicConn *quic.Conn) (err error) {
 	}
 }
 
-func (t *clientImpl) deferQuicConn(quicConn *quic.Conn, err error) {
+func (t *clientImpl) deferSession(session *clientSession, err error) {
 	var netError net.Error
 	if err != nil && errors.As(err, &netError) {
-		t.forceClose(quicConn, err)
+		t.forceClose(session, err)
 	}
 }
 
-func (t *clientImpl) forceClose(quicConn *quic.Conn, err error) {
+func (t *clientImpl) forceClose(session *clientSession, err error) {
 	t.connMutex.Lock()
 	defer t.connMutex.Unlock()
-	if quicConn == nil {
-		quicConn = t.quicConn
+	if session == nil {
+		session = t.session.Load()
 	}
-	if quicConn != nil {
-		if quicConn == t.quicConn {
-			t.quicConn = nil
-		}
+	if session == nil {
+		return
 	}
+	t.session.CompareAndSwap(session, nil)
 	errStr := ""
 	if err != nil {
 		errStr = err.Error()
 	}
-	if quicConn != nil {
-		_ = quicConn.CloseWithError(ProtocolError, errStr)
-	}
-	udpInputMap := &t.udpInputMap
-	udpInputMap.Range(func(key uint16, value net.Conn) bool {
-		conn := value
+	_ = session.conn.CloseWithError(ProtocolError, errStr)
+	session.udpInputMap.Range(func(key uint16, conn net.Conn) bool {
 		_ = conn.Close()
-		udpInputMap.Delete(key)
+		session.udpInputMap.Delete(key)
 		return true
 	})
 }
 
+func (t *clientImpl) releaseStream(session *clientSession) {
+	if session.openStreams.Add(-1) == 0 && t.closed.Load() {
+		t.forceClose(session, types.ClientClosed)
+	}
+}
+
 func (t *clientImpl) Close() {
+	t.connMutex.Lock()
 	t.closed.Store(true)
-	if t.openStreams.Load() == 0 {
-		t.forceClose(nil, types.ClientClosed)
+	session := t.session.Load()
+	idle := session != nil && session.openStreams.Load() == 0
+	t.connMutex.Unlock()
+	if idle {
+		t.forceClose(session, types.ClientClosed)
 	}
 }
 
 func (t *clientImpl) DialContext(ctx context.Context, metadata *C.Metadata) (net.Conn, error) {
-	quicConn, err := t.getQuicConn(ctx)
+	session, err := t.getSession(ctx)
 	if err != nil {
 		return nil, err
 	}
-	openStreams := t.openStreams.Add(1)
-	if openStreams >= t.MaxOpenStreams {
-		t.openStreams.Add(-1)
-		return nil, types.TooManyOpenStreams
-	}
+	quicConn := session.conn
 	stream, err := func() (stream net.Conn, err error) {
 		defer func() {
-			t.deferQuicConn(quicConn, err)
+			t.deferSession(session, err)
 		}()
 		buf := pool.GetBuffer()
 		defer pool.PutBuffer(buf)
 		err = NewConnect(NewAddress(metadata)).WriteTo(buf)
 		if err != nil {
-			t.openStreams.Add(-1)
+			t.releaseStream(session)
 			return nil, err
 		}
 		quicStream, err := quicConn.OpenStream()
 		if err != nil {
-			t.openStreams.Add(-1)
+			t.releaseStream(session)
 			return nil, err
 		}
 		stream = types.NewQuicStreamConn(
@@ -299,12 +305,7 @@ func (t *clientImpl) DialContext(ctx context.Context, metadata *C.Metadata) (net
 			quicConn.LocalAddr(),
 			quicConn.RemoteAddr(),
 			func() {
-				time.AfterFunc(C.DefaultTCPTimeout, func() {
-					openStreams := t.openStreams.Add(-1)
-					if openStreams == 0 && t.closed.Load() {
-						t.forceClose(quicConn, types.ClientClosed)
-					}
-				})
+				common.AfterGrace(C.DefaultTCPTimeout, t, session, (*clientImpl).releaseStream)
 			},
 		)
 		_, err = buf.WriteTo(stream)
@@ -322,40 +323,40 @@ func (t *clientImpl) DialContext(ctx context.Context, metadata *C.Metadata) (net
 }
 
 func (t *clientImpl) ListenPacket(ctx context.Context, metadata *C.Metadata) (net.PacketConn, error) {
-	quicConn, err := t.getQuicConn(ctx)
+	session, err := t.getSession(ctx)
 	if err != nil {
 		return nil, err
 	}
-	openStreams := t.openStreams.Add(1)
-	if openStreams >= t.MaxOpenStreams {
-		t.openStreams.Add(-1)
-		return nil, types.TooManyOpenStreams
-	}
+	quicConn := session.conn
 
 	pipe1, pipe2 := N.Pipe()
+	t.connMutex.Lock()
+	if t.session.Load() != session || t.closed.Load() {
+		t.connMutex.Unlock()
+		_ = pipe1.Close()
+		_ = pipe2.Close()
+		t.releaseStream(session)
+		return nil, types.ClientClosed
+	}
 	var connId uint16
 	for {
 		connId = uint16(randv2.IntN(0xFFFF))
-		_, loaded := t.udpInputMap.LoadOrStore(connId, pipe1)
+		_, loaded := session.udpInputMap.LoadOrStore(connId, pipe1)
 		if !loaded {
 			break
 		}
 	}
+	t.connMutex.Unlock()
 	pc := &quicStreamPacketConn{
 		connId:                connId,
 		quicConn:              quicConn,
 		inputConn:             N.NewBufferedConn(pipe2),
 		udpRelayMode:          t.UdpRelayMode,
 		maxUdpRelayPacketSize: t.MaxUdpRelayPacketSize,
-		deferQuicConnFn:       t.deferQuicConn,
+		deferQuicConnFn:       func(_ *quic.Conn, err error) { t.deferSession(session, err) },
 		closeDeferFn: func() {
-			t.udpInputMap.Delete(connId)
-			time.AfterFunc(C.DefaultUDPTimeout, func() {
-				openStreams := t.openStreams.Add(-1)
-				if openStreams == 0 && t.closed.Load() {
-					t.forceClose(quicConn, types.ClientClosed)
-				}
-			})
+			session.udpInputMap.Delete(connId)
+			common.AfterGrace(C.DefaultUDPTimeout, t, session, (*clientImpl).releaseStream)
 		},
 	}
 	return pc, nil
