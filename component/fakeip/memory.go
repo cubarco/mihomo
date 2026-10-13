@@ -3,78 +3,90 @@ package fakeip
 import (
 	"net/netip"
 
-	"github.com/metacubex/mihomo/common/lru"
+	"github.com/bahlo/generic-list-go"
 )
 
-type memoryStore struct {
-	cacheIP   *lru.LruCache[string, netip.Addr]
-	cacheHost *lru.LruCache[netip.Addr, string]
+type memoryEntry struct {
+	host string
+	ip   netip.Addr
 }
 
-// GetByHost implements store.GetByHost
-func (m *memoryStore) GetByHost(host string) (netip.Addr, bool) {
-	if ip, exist := m.cacheIP.Get(host); exist {
-		// ensure ip --> host on head of linked list
-		m.cacheHost.Get(ip)
-		return ip, true
-	}
+// Pool.mux protects both indexes and their shared recency list.
+type memoryStore struct {
+	byHost  map[string]*list.Element[memoryEntry]
+	byIP    map[netip.Addr]*list.Element[memoryEntry]
+	entries list.List[memoryEntry]
+	maxSize int
+}
 
+func (m *memoryStore) GetByHost(host string) (netip.Addr, bool) {
+	if entry := m.byHost[host]; entry != nil {
+		m.entries.MoveToBack(entry)
+		return entry.Value.ip, true
+	}
 	return netip.Addr{}, false
 }
 
-// PutByHost implements store.PutByHost
-func (m *memoryStore) PutByHost(host string, ip netip.Addr) {
-	m.cacheIP.Set(host, ip)
-}
-
-// GetByIP implements store.GetByIP
 func (m *memoryStore) GetByIP(ip netip.Addr) (string, bool) {
-	if host, exist := m.cacheHost.Get(ip); exist {
-		// ensure host --> ip on head of linked list
-		m.cacheIP.Get(host)
-		return host, true
+	if entry := m.byIP[ip]; entry != nil {
+		m.entries.MoveToBack(entry)
+		return entry.Value.host, true
 	}
-
 	return "", false
 }
 
-// PutByIP implements store.PutByIP
-func (m *memoryStore) PutByIP(ip netip.Addr, host string) {
-	m.cacheHost.Set(ip, host)
-}
-
-// DelByIP implements store.DelByIP
-func (m *memoryStore) DelByIP(ip netip.Addr) {
-	if host, exist := m.cacheHost.Get(ip); exist {
-		m.cacheIP.Delete(host)
+func (m *memoryStore) PutMapping(host string, ip netip.Addr) {
+	entry := m.byHost[host]
+	if previous := m.byIP[ip]; previous != nil && previous != entry {
+		if entry == nil {
+			entry = previous
+		} else {
+			m.remove(previous)
+		}
 	}
-	m.cacheHost.Delete(ip)
+	if entry == nil && m.maxSize > 0 && m.entries.Len() >= m.maxSize {
+		entry = m.entries.Front()
+	}
+	value := memoryEntry{host: host, ip: ip}
+	if entry == nil {
+		entry = m.entries.PushBack(value)
+	} else {
+		delete(m.byHost, entry.Value.host)
+		delete(m.byIP, entry.Value.ip)
+		entry.Value = value
+		m.entries.MoveToBack(entry)
+	}
+	m.byHost[host], m.byIP[ip] = entry, entry
 }
 
-// Exist implements store.Exist
+func (m *memoryStore) remove(entry *list.Element[memoryEntry]) {
+	delete(m.byHost, entry.Value.host)
+	delete(m.byIP, entry.Value.ip)
+	m.entries.Remove(entry)
+}
+
 func (m *memoryStore) Exist(ip netip.Addr) bool {
-	return m.cacheHost.Exist(ip)
+	return m.byIP[ip] != nil
 }
 
-// CloneTo implements store.CloneTo
-// only for memoryStore to memoryStore
 func (m *memoryStore) CloneTo(store store) {
-	if ms, ok := store.(*memoryStore); ok {
-		m.cacheIP.CloneTo(ms.cacheIP)
-		m.cacheHost.CloneTo(ms.cacheHost)
+	if ms, ok := store.(*memoryStore); ok && ms != m {
+		_ = ms.FlushFakeIP()
+		for entry := m.entries.Front(); entry != nil; entry = entry.Next() {
+			ms.PutMapping(entry.Value.host, entry.Value.ip)
+		}
 	}
 }
 
-// FlushFakeIP implements store.FlushFakeIP
 func (m *memoryStore) FlushFakeIP() error {
-	m.cacheIP.Clear()
-	m.cacheHost.Clear()
+	m.byHost = make(map[string]*list.Element[memoryEntry])
+	m.byIP = make(map[netip.Addr]*list.Element[memoryEntry])
+	m.entries.Init()
 	return nil
 }
 
 func newMemoryStore(size int) *memoryStore {
-	return &memoryStore{
-		cacheIP:   lru.New[string, netip.Addr](lru.WithSize[string, netip.Addr](size)),
-		cacheHost: lru.New[netip.Addr, string](lru.WithSize[netip.Addr, string](size)),
-	}
+	m := &memoryStore{maxSize: size}
+	_ = m.FlushFakeIP()
+	return m
 }

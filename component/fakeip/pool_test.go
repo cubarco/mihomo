@@ -3,7 +3,8 @@ package fakeip
 import (
 	"fmt"
 	"net/netip"
-	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,48 +12,36 @@ import (
 
 	"github.com/metacubex/bbolt"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func createPools(options Options) ([]*Pool, string, error) {
+func createPools(t *testing.T, options Options) []*Pool {
+	t.Helper()
 	pool, err := New(options)
-	if err != nil {
-		return nil, "", err
-	}
-	filePool, tempfile, err := createCachefileStore(options)
-	if err != nil {
-		return nil, "", err
-	}
-
-	return []*Pool{pool, filePool}, tempfile, nil
+	require.NoError(t, err)
+	filePool, _ := createCachefileStore(t, options, filepath.Join(t.TempDir(), "cache.db"))
+	return []*Pool{pool, filePool}
 }
 
-func createCachefileStore(options Options) (*Pool, string, error) {
+func createCachefileStore(t *testing.T, options Options, path string) (*Pool, *bbolt.DB) {
+	t.Helper()
+	options.Persistence = false
 	pool, err := New(options)
-	if err != nil {
-		return nil, "", err
-	}
-	f, err := os.CreateTemp("", "mihomo")
-	if err != nil {
-		return nil, "", err
-	}
-
-	db, err := bbolt.Open(f.Name(), 0o666, &bbolt.Options{Timeout: time.Second, NoStatistics: true})
-	if err != nil {
-		return nil, "", err
-	}
-
+	require.NoError(t, err)
+	db, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: time.Second, NoStatistics: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
 	pool.store = newCachefileStore(&cachefile.CacheFile{DB: db}, options.IPNet)
-	return pool, f.Name(), nil
+	pool.restoreState()
+	return pool, db
 }
 
 func TestPool_Basic(t *testing.T) {
 	ipnet := netip.MustParsePrefix("192.168.0.0/28")
-	pools, tempfile, err := createPools(Options{
+	pools := createPools(t, Options{
 		IPNet: ipnet,
 		Size:  10,
 	})
-	assert.Nil(t, err)
-	defer os.Remove(tempfile)
 
 	for _, pool := range pools {
 		first := pool.Lookup("foo.com")
@@ -75,12 +64,10 @@ func TestPool_Basic(t *testing.T) {
 
 func TestPool_BasicV6(t *testing.T) {
 	ipnet := netip.MustParsePrefix("2001:4860:4860::8888/118")
-	pools, tempfile, err := createPools(Options{
+	pools := createPools(t, Options{
 		IPNet: ipnet,
 		Size:  10,
 	})
-	assert.Nil(t, err)
-	defer os.Remove(tempfile)
 
 	for _, pool := range pools {
 		first := pool.Lookup("foo.com")
@@ -103,12 +90,10 @@ func TestPool_BasicV6(t *testing.T) {
 
 func TestPool_Case_Insensitive(t *testing.T) {
 	ipnet := netip.MustParsePrefix("192.168.0.1/29")
-	pools, tempfile, err := createPools(Options{
+	pools := createPools(t, Options{
 		IPNet: ipnet,
 		Size:  10,
 	})
-	assert.Nil(t, err)
-	defer os.Remove(tempfile)
 
 	for _, pool := range pools {
 		first := pool.Lookup("foo.com")
@@ -124,12 +109,10 @@ func TestPool_Case_Insensitive(t *testing.T) {
 
 func TestPool_CycleUsed(t *testing.T) {
 	ipnet := netip.MustParsePrefix("192.168.0.16/28")
-	pools, tempfile, err := createPools(Options{
+	pools := createPools(t, Options{
 		IPNet: ipnet,
 		Size:  10,
 	})
-	assert.Nil(t, err)
-	defer os.Remove(tempfile)
 
 	for _, pool := range pools {
 		foo := pool.Lookup("foo.com")
@@ -251,12 +234,10 @@ func TestPool_Error(t *testing.T) {
 
 func TestPool_FlushFileCache(t *testing.T) {
 	ipnet := netip.MustParsePrefix("192.168.0.1/28")
-	pools, tempfile, err := createPools(Options{
+	pools := createPools(t, Options{
 		IPNet: ipnet,
 		Size:  10,
 	})
-	assert.Nil(t, err)
-	defer os.Remove(tempfile)
 
 	for _, pool := range pools {
 		foo := pool.Lookup("foo.com")
@@ -264,7 +245,7 @@ func TestPool_FlushFileCache(t *testing.T) {
 		bax := pool.Lookup("baz.com")
 		fox := pool.Lookup("foo.com")
 
-		err = pool.FlushFakeIP()
+		err := pool.FlushFakeIP()
 		assert.Nil(t, err)
 
 		next := pool.Lookup("baz.com")
@@ -307,4 +288,119 @@ func TestPool_FlushMemoryCache(t *testing.T) {
 	assert.Equal(t, bar, baz)
 	assert.NotEqual(t, bar, next)
 	assert.Equal(t, baz, nero)
+}
+
+func TestPool_ReverseLookupAndCloneBudgets(t *testing.T) {
+	options := Options{IPNet: netip.MustParsePrefix("198.18.0.0/24"), Size: 3}
+	source, err := New(options)
+	require.NoError(t, err)
+	foo, bar, baz := source.Lookup("foo.test"), source.Lookup("bar.test"), source.Lookup("baz.test")
+	_, _ = source.LookBack(foo)
+	options.Size = 2
+	clone, err := New(options)
+	require.NoError(t, err)
+	clone.Lookup("discard.test")
+	clone.CloneFrom(source)
+	clone.CloneFrom(clone)
+	require.False(t, clone.Exist(bar))
+	for host, ip := range map[string]netip.Addr{"foo.test": foo, "baz.test": baz} {
+		got, ok := clone.LookBack(ip)
+		require.True(t, ok)
+		require.Equal(t, host, got)
+	}
+	_, _ = clone.LookBack(foo)
+	clone.Lookup("next.test")
+	require.True(t, clone.Exist(foo))
+	require.False(t, clone.Exist(baz))
+	require.Equal(t, baz, source.Lookup("baz.test"))
+	require.NoError(t, clone.FlushFakeIP())
+	require.Equal(t, foo, source.Lookup("foo.test"))
+	require.Equal(t, bar, source.Lookup("bar.test"))
+}
+
+func TestPool_UnboundedMemory(t *testing.T) {
+	for _, size := range []int{0, -1} {
+		pool, err := New(Options{IPNet: netip.MustParsePrefix("198.18.0.0/16"), Size: size})
+		require.NoError(t, err)
+		first := pool.Lookup("first.test")
+		for i := 0; i < 1001; i++ {
+			pool.Lookup(fmt.Sprintf("host-%d.test", i))
+		}
+		require.Equal(t, first, pool.Lookup("first.test"))
+	}
+}
+
+func TestPool_PersistentTransactionsAndRestore(t *testing.T) {
+	for _, prefix := range []string{"198.18.0.0/29", "fc00::/125"} {
+		t.Run(prefix, func(t *testing.T) {
+			options := Options{IPNet: netip.MustParsePrefix(prefix)}
+			path := filepath.Join(t.TempDir(), "cache.db")
+			pool, db := createCachefileStore(t, options, path)
+			txID := func() int {
+				var id int
+				require.NoError(t, db.View(func(tx *bbolt.Tx) error { id = tx.ID(); return nil }))
+				return id
+			}
+			for _, host := range []string{"a.test", "b.test", "c.test", "d.test"} {
+				before := txID()
+				ip := pool.Lookup(host)
+				require.Equal(t, before+1, txID(), "one commit per new mapping, including wraparound")
+				require.Equal(t, ip, pool.Lookup(host))
+				require.Equal(t, before+1, txID(), "cache hits must not commit")
+			}
+			pool.StoreState()
+			require.NoError(t, db.Close())
+			pool, db = createCachefileStore(t, options, path)
+			require.True(t, pool.cycle)
+			require.Equal(t, pool.first, pool.Lookup("d.test"))
+			require.Equal(t, pool.first.Next(), pool.Lookup("e.test"))
+			host, ok := pool.LookBack(pool.first)
+			require.True(t, ok)
+			require.Equal(t, "d.test", host)
+			require.NoError(t, pool.FlushFakeIP())
+			pool.StoreState()
+			require.NoError(t, db.Close())
+			pool, _ = createCachefileStore(t, options, path)
+			require.False(t, pool.cycle)
+			require.False(t, pool.Exist(pool.first))
+			require.Equal(t, pool.first, pool.Lookup("fresh.test"))
+		})
+	}
+}
+
+func TestPool_ConcurrentFlushAndState(t *testing.T) {
+	pools := createPools(t, Options{IPNet: netip.MustParsePrefix("198.18.0.0/28"), Size: 4})
+	for i, pool := range pools {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			start := make(chan struct{})
+			var workers sync.WaitGroup
+			for worker := 0; worker < 4; worker++ {
+				workers.Go(func() {
+					<-start
+					for j := 0; j < 32; j++ {
+						switch worker {
+						case 0:
+							pool.Lookup(fmt.Sprintf("host-%d.test", j))
+						case 1:
+							_, _ = pool.LookBack(pool.first)
+							pool.Exist(pool.first)
+						case 2:
+							if err := pool.FlushFakeIP(); err != nil {
+								t.Error(err)
+							}
+						case 3:
+							pool.StoreState()
+						}
+					}
+				})
+			}
+			close(start)
+			workers.Wait()
+			require.NoError(t, pool.FlushFakeIP())
+			require.Equal(t, pool.first, pool.Lookup("after.test"))
+			host, ok := pool.LookBack(pool.first)
+			require.True(t, ok)
+			require.Equal(t, "after.test", host)
+		})
+	}
 }
