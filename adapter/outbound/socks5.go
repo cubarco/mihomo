@@ -187,6 +187,9 @@ func NewSocks5(option Socks5Option) (*Socks5, error) {
 		if err != nil {
 			return nil, err
 		}
+		if option.Certificate == "" && option.PrivateKey == "" {
+			tlsConfig.ClientSessionCache = tls.NewLRUClientSessionCache(1)
+		}
 	}
 
 	outbound := &Socks5{

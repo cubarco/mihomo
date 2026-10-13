@@ -166,6 +166,9 @@ func NewHttp(option HttpOption) (*Http, error) {
 		if err != nil {
 			return nil, err
 		}
+		if option.Certificate == "" && option.PrivateKey == "" {
+			tlsConfig.ClientSessionCache = tls.NewLRUClientSessionCache(1)
+		}
 	}
 
 	outbound := &Http{

@@ -177,6 +177,7 @@ func StreamTLSConn(ctx context.Context, conn net.Conn, cfg *TLSConfig) (net.Conn
 		return nil, err
 	}
 
+	tlsConfig.ClientSessionCache = sharedTLSSessions.forConfig(cfg, tlsConfig)
 	tlsConn := tls.Client(conn, tlsConfig)
 
 	err = tlsConn.HandshakeContext(ctx)
