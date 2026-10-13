@@ -248,12 +248,14 @@ func updateNTP(c *config.NTP) {
 }
 
 func updateDNS(c *config.DNS, generalIPv6 bool) {
+	retired := []resolver.Resolver{resolver.DefaultResolver, resolver.ProxyServerHostResolver, resolver.DirectHostResolver}
 	if !c.Enable {
 		resolver.DefaultResolver = nil
 		resolver.DefaultHostMapper = nil
 		resolver.DefaultService = nil
 		resolver.ProxyServerHostResolver = nil
 		resolver.DirectHostResolver = nil
+		resolver.CloseQueries(retired...)
 		dns.ReCreateServer("", nil, nil)
 		return
 	}
@@ -312,6 +314,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 
 	lc := inbound.NewListenConfig()
 	lc.SetRouteMark(c.ListenRoutingMark)
+	resolver.CloseQueries(retired...)
 	dns.ReCreateServer(c.Listen, lc, s)
 }
 
@@ -558,6 +561,7 @@ func Shutdown() {
 	listener.Cleanup()
 	tproxy.CleanupTProxyIPTables()
 	resolver.StoreFakePoolState()
+	updateDNS(&config.DNS{}, false)
 
 	log.Warnln("Mihomo shutting down")
 }

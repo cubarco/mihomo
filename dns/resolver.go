@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/arc"
@@ -48,6 +49,11 @@ type Resolver struct {
 	cache                 dnsCache
 	policy                []dnsPolicy
 	defaultResolver       *Resolver
+	queryOnce             sync.Once
+	queryCtx              context.Context
+	queryCancel           context.CancelFunc
+	refreshMu             sync.Mutex
+	refreshing            map[D.Question]struct{}
 }
 
 func (r *Resolver) LookupIPPrimaryIPv4(ctx context.Context, host string) (ips []netip.Addr, err error) {
@@ -153,17 +159,9 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 	if len(m.Question) == 0 {
 		return nil, errors.New("should have one question at least")
 	}
-	continueFetch := false
-	defer func() {
-		if continueFetch || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
-				defer cancel()
-				_, _ = r.exchangeWithoutCache(ctx, m) // ignore result, just for putMsgToCache
-			}()
-		}
-	}()
-
+	if err := r.queryContext().Err(); err != nil {
+		return nil, err
+	}
 	q := m.Question[0]
 	domain := msgToDomain(m)
 	msg, expireTime, hit := getMsgFromCache(r.cache, q)
@@ -173,7 +171,7 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 		now := time.Now()
 		if expireTime.Before(now) {
 			setMsgTTL(msg, uint32(1)) // Continue fetch
-			continueFetch = true
+			r.refresh(m)
 		} else {
 			// updating TTL by subtracting common delta time from each DNS record
 			updateMsgTTL(msg, uint32(time.Until(expireTime).Seconds()))
@@ -185,13 +183,18 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 
 // ExchangeWithoutCache a batch of dns request, and it do NOT GET from cache
 func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
+	parent := r.queryContext()
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
 	q := m.Question[0]
+	m = m.Copy()
 
 	retryNum := 0
 	retryMax := 3
 	initiator := queryInitiator(ctx)
 	fn := func() (result *D.Msg, err error) {
-		ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout) // reset timeout in singleflight
+		ctx, cancel := context.WithTimeout(parent, resolver.DefaultDNSTimeout)
 		defer cancel()
 		ctx, trace := r.traceExchange(ctx, q, initiator)
 		cache := false
@@ -210,6 +213,9 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 		}()
 
 		defer func() { trace.finish(result, err) }()
+		if err = ctx.Err(); err != nil {
+			return nil, err
+		}
 
 		isIPReq := isIPRequest(q)
 		if isIPReq {
@@ -240,7 +246,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 			go func() { // start a retrying monitor in background
 				result := <-ch
 				ret, err, shared := result.Val, result.Err, result.Shared
-				if err != nil && !shared && ret.Opcode < retryMax { // retry
+				if err != nil && !shared && ret.Opcode < retryMax && parent.Err() == nil { // retry
 					r.group.DoChan(q.String(), fn)
 				}
 			}()
@@ -249,7 +255,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 	}
 
 	ret, err, shared := result.Val, result.Err, result.Shared
-	if err != nil && !shared && ret.Opcode < retryMax { // retry
+	if err != nil && !shared && ret.Opcode < retryMax && parent.Err() == nil { // retry
 		r.group.DoChan(q.String(), fn)
 	}
 

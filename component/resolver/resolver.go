@@ -244,6 +244,14 @@ func ResetConnection() {
 	go SystemResolver.ResetConnection() // SystemResolver unneeded check nil
 }
 
+func CloseQueries(resolvers ...Resolver) {
+	for _, r := range resolvers {
+		if closer, ok := r.(interface{ CloseQueries() }); ok {
+			closer.CloseQueries()
+		}
+	}
+}
+
 func SortationAddr(ips []netip.Addr) (ipv4s, ipv6s []netip.Addr) {
 	for _, v := range ips {
 		if v.Unmap().Is4() {
