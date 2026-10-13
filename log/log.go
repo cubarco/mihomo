@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"sync/atomic"
+	"unicode/utf8"
 
 	"github.com/metacubex/mihomo/common/observable"
 
@@ -34,6 +35,20 @@ type Event struct {
 	Payload  string
 }
 
+const MaxPayloadBytes = 16 * 1024
+
+func (e Event) Bounded() Event {
+	if len(e.Payload) > MaxPayloadBytes {
+		const suffix = "... [truncated]"
+		end := MaxPayloadBytes - len(suffix)
+		for end > 0 && !utf8.RuneStart(e.Payload[end]) {
+			end--
+		}
+		e.Payload = e.Payload[:end] + suffix
+	}
+	return e
+}
+
 func (e *Event) Type() string {
 	return e.LogLevel.String()
 }
@@ -58,6 +73,7 @@ func emit(event Event) {
 	if EventFilter != nil && !EventFilter(event) {
 		return
 	}
+	event = event.Bounded()
 	logCh <- event
 	print(event)
 }

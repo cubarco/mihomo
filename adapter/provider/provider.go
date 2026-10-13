@@ -351,6 +351,11 @@ func (cp *CompatibleProvider) Close() error {
 }
 
 func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilter string, excludeType string, dialerProxy string, override overrideSchema, ageSecretKey string) (resource.Parser[[]C.Proxy], error) {
+	for _, rename := range override.ProxyName {
+		if rename.Pattern == nil || rename.Pattern.Regexp == nil {
+			return nil, errors.New("proxy name replacement requires a pattern")
+		}
+	}
 	var excludeTypeArray []string
 	if excludeType != "" {
 		excludeTypeArray = strings.Split(excludeType, "|")
@@ -359,7 +364,7 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 	var excludeFilterRegs []*regexp2.Regexp
 	if excludeFilter != "" {
 		for _, excludeFilter := range strings.Split(excludeFilter, "`") {
-			excludeFilterReg, err := regexp2.Compile(excludeFilter, regexp2.None)
+			excludeFilterReg, err := utils.CompileNameRegex(excludeFilter)
 			if err != nil {
 				return nil, fmt.Errorf("invalid excludeFilter regex: %w", err)
 			}
@@ -369,7 +374,7 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 
 	var filterRegs []*regexp2.Regexp
 	for _, filter := range strings.Split(filter, "`") {
-		filterReg, err := regexp2.Compile(filter, regexp2.None)
+		filterReg, err := utils.CompileNameRegex(filter)
 		if err != nil {
 			return nil, fmt.Errorf("invalid filter regex: %w", err)
 		}
@@ -441,13 +446,21 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 				}
 				if len(excludeFilterRegs) > 0 {
 					for _, excludeFilterReg := range excludeFilterRegs {
-						if mat, _ := excludeFilterReg.MatchString(name); mat {
+						mat, err := excludeFilterReg.MatchString(name)
+						if err != nil {
+							return nil, fmt.Errorf("exclude-filter evaluation failed: %w", err)
+						}
+						if mat {
 							continue LOOP1
 						}
 					}
 				}
 				if len(filter) > 0 {
-					if mat, _ := filterReg.MatchString(name); !mat {
+					mat, err := filterReg.MatchString(name)
+					if err != nil {
+						return nil, fmt.Errorf("filter evaluation failed: %w", err)
+					}
+					if !mat {
 						continue
 					}
 				}

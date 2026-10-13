@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/dlclark/regexp2"
+	"github.com/metacubex/mihomo/common/utils"
 )
 
 type overrideSchema struct {
@@ -29,12 +30,24 @@ type overrideSchema struct {
 
 type overrideProxyNameSchema struct {
 	// matching expression for regex replacement
-	Pattern *regexp2.Regexp `provider:"pattern"`
+	Pattern *namePattern `provider:"pattern"`
 	// the new content after regex matching
 	Target string `provider:"target"`
 }
 
-var _ encoding.TextUnmarshaler = (*regexp2.Regexp)(nil) // ensure *regexp2.Regexp can decode direct by structure package
+type namePattern struct {
+	*regexp2.Regexp
+}
+
+func (p *namePattern) UnmarshalText(text []byte) error {
+	compiled, err := utils.CompileNameRegex(string(text))
+	if err == nil {
+		p.Regexp = compiled
+	}
+	return err
+}
+
+var _ encoding.TextUnmarshaler = (*namePattern)(nil)
 
 func (o *overrideSchema) Apply(mapping map[string]any) error {
 	if o.TFO != nil {

@@ -232,7 +232,12 @@ func (hc *HealthCheck) execute(ctx context.Context, b *errgroup.Group, proxies [
 				filters = append(filters, filter)
 			}
 
-			filterReg = regexp2.MustCompile(strings.Join(filters, "|"), regexp2.None)
+			var err error
+			filterReg, err = utils.CompileNameRegex(strings.Join(filters, "|"))
+			if err != nil {
+				log.Errorln("Health check filter is invalid: %v", err)
+				return
+			}
 		}
 	}
 
@@ -246,7 +251,12 @@ func (hc *HealthCheck) execute(ctx context.Context, b *errgroup.Group, proxies [
 		}
 		// skip proxies that do not require health check
 		if filterReg != nil {
-			if match, _ := filterReg.MatchString(proxy.Name()); !match {
+			match, err := filterReg.MatchString(proxy.Name())
+			if err != nil {
+				log.Errorln("Health check filter evaluation failed: %v", err)
+				return
+			}
+			if !match {
 				continue
 			}
 		}

@@ -64,7 +64,7 @@ func NewGroupBase(opt GroupBaseOption) *GroupBase {
 	var excludeFilterRegs []*regexp2.Regexp
 	if opt.ExcludeFilter != "" {
 		for _, excludeFilter := range strings.Split(opt.ExcludeFilter, "`") {
-			excludeFilterReg := regexp2.MustCompile(excludeFilter, regexp2.None)
+			excludeFilterReg := utils.MustCompileNameRegex(excludeFilter)
 			excludeFilterRegs = append(excludeFilterRegs, excludeFilterReg)
 		}
 	}
@@ -72,7 +72,7 @@ func NewGroupBase(opt GroupBaseOption) *GroupBase {
 	var filterRegs []*regexp2.Regexp
 	if opt.Filter != "" {
 		for _, filter := range strings.Split(opt.Filter, "`") {
-			filterReg := regexp2.MustCompile(filter, regexp2.None)
+			filterReg := utils.MustCompileNameRegex(filter)
 			filterRegs = append(filterRegs, filterReg)
 		}
 	}
@@ -136,6 +136,15 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 	if slices.Equal(providerVersions, gb.providerVersions) {
 		return gb.providerProxies
 	}
+	var filterError error
+	matchName := func(pattern *regexp2.Regexp, name string) bool {
+		if filterError != nil {
+			return false
+		}
+		matched, err := pattern.MatchString(name)
+		filterError = err
+		return matched
+	}
 
 	var proxies []C.Proxy
 	if len(gb.filterRegs) == 0 {
@@ -154,7 +163,7 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 			for _, filterReg := range gb.filterRegs {
 				for _, p := range pd.Proxies() {
 					name := p.Name()
-					if mat, _ := filterReg.MatchString(name); mat {
+					if matchName(filterReg, name) {
 						if _, ok := proxiesSet[name]; !ok {
 							proxiesSet[name] = struct{}{}
 							newProxies = append(newProxies, p)
@@ -175,7 +184,7 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 		for _, filterReg := range gb.filterRegs {
 			for _, p := range proxies {
 				name := p.Name()
-				if mat, _ := filterReg.MatchString(name); mat {
+				if matchName(filterReg, name) {
 					if _, ok := proxiesSet[name]; !ok {
 						proxiesSet[name] = struct{}{}
 						newProxies = append(newProxies, p)
@@ -199,7 +208,7 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 		for _, p := range proxies {
 			name := p.Name()
 			for _, excludeFilterReg := range gb.excludeFilterRegs {
-				if mat, _ := excludeFilterReg.MatchString(name); mat {
+				if matchName(excludeFilterReg, name) {
 					continue LOOP1
 				}
 			}
@@ -223,6 +232,14 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 		proxies = newProxies
 	}
 
+	if filterError != nil {
+		log.Errorln("Proxy group %s filter evaluation failed; keeping the last selection: %v", gb.Name(), filterError)
+		gb.providerVersions = providerVersions
+		if len(gb.providerProxies) == 0 {
+			gb.providerProxies = []C.Proxy{gb.EmptyFallback()}
+		}
+		return gb.providerProxies
+	}
 	if len(proxies) == 0 {
 		return []C.Proxy{gb.EmptyFallback()}
 	}

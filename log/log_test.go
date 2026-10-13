@@ -1,8 +1,10 @@
 package log
 
 import (
+	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestLogLevelDuringConcurrentLogging(t *testing.T) {
@@ -26,4 +28,23 @@ func TestLogLevelDuringConcurrentLogging(t *testing.T) {
 		Debugln("connection cleanup")
 	}
 	writer.Wait()
+}
+
+func TestLogPayloadLimitPreservesUTF8AndFiltersOriginal(t *testing.T) {
+	payload := strings.Repeat("界🙂", MaxPayloadBytes)
+	bounded := (Event{LogLevel: WARNING, Payload: payload}).Bounded()
+	if len(bounded.Payload) > MaxPayloadBytes || !utf8.ValidString(bounded.Payload) || !strings.HasSuffix(bounded.Payload, "... [truncated]") || bounded.LogLevel != WARNING {
+		t.Fatal("oversized log lost its UTF-8 boundary, size limit or severity")
+	}
+	previous := EventFilter
+	defer func() { EventFilter = previous }()
+	sawOriginal := false
+	EventFilter = func(event Event) bool {
+		sawOriginal = event.Payload == payload
+		return false
+	}
+	emit(Event{Payload: payload})
+	if !sawOriginal {
+		t.Fatal("output filtering ran after truncation")
+	}
 }
