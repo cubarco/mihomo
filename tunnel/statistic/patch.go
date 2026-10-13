@@ -1,5 +1,7 @@
 package statistic
 
+import "time"
+
 type RequestNotify func(c Tracker)
 
 var DefaultRequestNotify RequestNotify
@@ -14,8 +16,9 @@ func (m *Manager) TotalTraffic(onlyProxy bool) (up, down int64) {
 }
 
 func (m *Manager) NowTraffic(onlyProxy bool) (up, down int64) {
+	rates := m.sampleRates(time.Now())
 	if onlyProxy {
-		return m.proxyUploadBlip.Load(), m.proxyDownloadBlip.Load()
+		return rates[2], rates[3]
 	}
-	return m.uploadBlip.Load(), m.downloadBlip.Load()
+	return rates[0], rates[1]
 }

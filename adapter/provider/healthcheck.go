@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/singledo"
 	"github.com/metacubex/mihomo/common/utils"
@@ -15,12 +16,6 @@ import (
 	"github.com/dlclark/regexp2"
 	"golang.org/x/sync/errgroup"
 )
-
-var healthCheckSuspended = atomic.NewBool(false)
-
-func SetHealthCheckSuspended(suspended bool) {
-	healthCheckSuspended.Store(suspended)
-}
 
 type HealthCheckOption struct {
 	URL      string
@@ -44,27 +39,43 @@ type HealthCheck struct {
 	expectedStatus utils.IntRanges[uint16]
 	lastTouch      atomic.TypedValue[time.Time]
 	singleDo       *singledo.Single[struct{}]
+	scheduledDo    *singledo.Single[struct{}]
 	timeout        time.Duration
 }
 
 func (hc *HealthCheck) process() {
-	ticker := time.NewTicker(hc.interval)
-	go hc.check()
+	var ticker *time.Ticker
+	var ticks <-chan time.Time
+	defer func() {
+		if ticker != nil {
+			ticker.Stop()
+		}
+	}()
+	go hc.checkScheduled()
 	for {
+		paused, _, changed := backgroundHealthChecks.state()
+		if paused && ticker != nil {
+			ticker.Stop()
+			ticker, ticks = nil, nil
+		} else if !paused && ticker == nil {
+			ticker = time.NewTicker(hc.interval)
+			ticks = ticker.C
+		}
 		select {
-		case <-ticker.C:
-			if healthCheckSuspended.Load() {
-				continue
+		case <-changed:
+			if ticker != nil {
+				ticker.Stop()
+				ticker, ticks = nil, nil
 			}
+		case <-ticks:
 			lastTouch := hc.lastTouch.Load()
 			since := time.Since(lastTouch)
 			if !hc.lazy || since < hc.interval {
-				hc.check()
+				hc.checkScheduled()
 			} else {
 				log.Debugln("Skip once health check because we are lazy")
 			}
 		case <-hc.ctx.Done():
-			ticker.Stop()
 			return
 		}
 	}
@@ -132,7 +143,26 @@ func (hc *HealthCheck) touch() {
 }
 
 func (hc *HealthCheck) check() {
-	if healthCheckSuspended.Load() {
+	hc.checkWithContext(hc.ctx, false)
+}
+
+func (hc *HealthCheck) checkScheduled() {
+	paused, active, _ := backgroundHealthChecks.state()
+	if paused || active.Err() != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(hc.ctx)
+	stop := context.AfterFunc(active, cancel)
+	defer stop()
+	defer cancel()
+	if active.Err() != nil {
+		return
+	}
+	hc.checkWithContext(adapter.WithBackgroundURLTest(ctx), true)
+}
+
+func (hc *HealthCheck) checkWithContext(ctx context.Context, scheduled bool) {
+	if healthCheckSuspended.Load() || ctx.Err() != nil {
 		return
 	}
 	hc.mu.Lock()
@@ -155,23 +185,28 @@ func (hc *HealthCheck) check() {
 		return
 	}
 
-	_, _, _ = hc.singleDo.Do(func() (struct{}, error) {
-		if healthCheckSuspended.Load() {
+	singleDo := hc.singleDo
+	if scheduled {
+		singleDo = hc.scheduledDo
+	}
+	_, _, _ = singleDo.Do(func() (struct{}, error) {
+		if healthCheckSuspended.Load() || ctx.Err() != nil {
 			return struct{}{}, nil
 		}
 		id := utils.NewUUIDV4().String()
 		log.Debugln("Start New Health Checking {%s}", id)
 		b := new(errgroup.Group)
 		b.SetLimit(10)
+		began := time.Now()
 
 		// execute default health check
 		option := &extraOption{filters: nil, expectedStatus: expectedStatus}
-		hc.execute(b, proxies, url, id, option)
+		hc.execute(ctx, b, proxies, url, id, option, scheduled, began)
 
 		// execute extra health check
 		if len(extra) != 0 {
 			for url, option := range extra {
-				hc.execute(b, proxies, url, id, option)
+				hc.execute(ctx, b, proxies, url, id, option, scheduled, began)
 			}
 		}
 		_ = b.Wait()
@@ -180,7 +215,7 @@ func (hc *HealthCheck) check() {
 	})
 }
 
-func (hc *HealthCheck) execute(b *errgroup.Group, proxies []C.Proxy, url, uid string, option *extraOption) {
+func (hc *HealthCheck) execute(ctx context.Context, b *errgroup.Group, proxies []C.Proxy, url, uid string, option *extraOption, scheduled bool, began time.Time) {
 	url = strings.TrimSpace(url)
 	if len(url) == 0 {
 		log.Debugln("Health Check has been skipped due to testUrl is empty, {%s}", uid)
@@ -201,7 +236,14 @@ func (hc *HealthCheck) execute(b *errgroup.Group, proxies []C.Proxy, url, uid st
 		}
 	}
 
+	if scheduled {
+		proxies = prioritizeHealthChecks(proxies, url)
+	}
+	expected := expectedStatus.String()
 	for _, proxy := range proxies {
+		if ctx.Err() != nil {
+			return
+		}
 		// skip proxies that do not require health check
 		if filterReg != nil {
 			if match, _ := filterReg.MatchString(proxy.Name()); !match {
@@ -210,8 +252,24 @@ func (hc *HealthCheck) execute(b *errgroup.Group, proxies []C.Proxy, url, uid st
 		}
 
 		p := proxy
+		if scheduled {
+			if err := backgroundHealthChecks.slots.Acquire(ctx, 1); err != nil {
+				return
+			}
+			if ctx.Err() != nil || measuredInHealthCheckRound(p, url, expected, hc.timeout, began) {
+				backgroundHealthChecks.slots.Release(1)
+				continue
+			}
+		}
 		b.Go(func() error {
-			ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
+			if scheduled {
+				defer backgroundHealthChecks.slots.Release(1)
+			}
+			if ctx.Err() != nil {
+				return nil
+			}
+			// Queueing is outside the network timeout and never publishes a failure.
+			ctx, cancel := context.WithTimeout(ctx, hc.timeout)
 			defer cancel()
 			log.Debugln("Health Checking, proxy: %s, url: %s, id: {%s}", p.Name(), url, uid)
 			_, _ = p.URLTest(ctx, url, expectedStatus)
@@ -246,5 +304,6 @@ func NewHealthCheck(proxies []C.Proxy, url string, timeout uint, interval uint, 
 		lazy:           lazy,
 		expectedStatus: expectedStatus,
 		singleDo:       singledo.NewSingle[struct{}](time.Second),
+		scheduledDo:    singledo.NewSingle[struct{}](time.Second),
 	}
 }

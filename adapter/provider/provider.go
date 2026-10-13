@@ -73,6 +73,10 @@ func (bp *baseProvider) HealthCheck() {
 	bp.healthCheck.check()
 }
 
+func (bp *baseProvider) HealthCheckBackground() {
+	bp.healthCheck.checkScheduled()
+}
+
 func (bp *baseProvider) Type() P.ProviderType {
 	return P.Proxy
 }
@@ -108,7 +112,7 @@ func (bp *baseProvider) setProxies(proxies []C.Proxy) {
 	bp.version += 1
 	bp.healthCheck.setProxies(proxies)
 	if bp.healthCheck.auto() {
-		go bp.healthCheck.check()
+		go bp.healthCheck.checkScheduled()
 	}
 }
 

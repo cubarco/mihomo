@@ -30,12 +30,14 @@ const (
 
 type internalProxyState struct {
 	lastTest uint64
+	expected string
 	alive    atomic.Bool
 	history  *queue.Queue[C.DelayHistory]
 }
 
 type Proxy struct {
 	C.ProxyAdapter
+	urlTests     urlTestFlights
 	testSequence atomic.Uint64
 	testMu       sync.Mutex
 	lastTest     uint64
@@ -167,9 +169,7 @@ func (p *Proxy) MarshalJSON() ([]byte, error) {
 	return json.Marshal(mapping)
 }
 
-// URLTest get the delay for the specified URL
-// implements C.Proxy
-func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (t uint16, err error) {
+func (p *Proxy) urlTestOnce(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (t uint16, err error) {
 	probe := p.testSequence.Add(1)
 	var satisfied bool
 
@@ -177,7 +177,7 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 		// Superseded/manual cancellation says nothing about reachability. In
 		// particular, it must not overwrite a newer probe's successful state.
 		// A real probe deadline still records a failure.
-		if errors.Is(err, context.Canceled) {
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 			return
 		}
 		// Keep health state and event publication ordered by probe start.
@@ -193,6 +193,7 @@ func (p *Proxy) URLTest(ctx context.Context, url string, expectedStatus utils.In
 			return
 		}
 		state.lastTest = probe
+		state.expected = expectedStatus.String()
 		alive := err == nil
 		record := C.DelayHistory{Time: time.Now()}
 		if alive {

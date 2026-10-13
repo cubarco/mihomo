@@ -311,7 +311,11 @@ func (gb *GroupBase) healthCheck() {
 		proxyProvider := proxyProvider
 		go func() {
 			defer wg.Done()
-			proxyProvider.HealthCheck()
+			if background, ok := proxyProvider.(interface{ HealthCheckBackground() }); ok {
+				background.HealthCheckBackground()
+			} else {
+				proxyProvider.HealthCheck()
+			}
 		}()
 	}
 
