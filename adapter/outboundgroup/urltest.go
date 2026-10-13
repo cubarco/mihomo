@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/callback"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/singledo"
@@ -20,13 +22,14 @@ type URLTestOption struct {
 
 type URLTest struct {
 	*GroupBase
-	selected       string
+	selected       atomic.TypedValue[string]
 	testUrl        string
 	expectedStatus string
 	tolerance      uint16
 	disableUDP     bool
 	fastNode       C.Proxy
 	fastSingle     *singledo.Single[C.Proxy]
+	fastMu         sync.Mutex
 }
 
 func (u *URLTest) Now() string {
@@ -49,7 +52,9 @@ func (u *URLTest) Set(name string) error {
 }
 
 func (u *URLTest) ForceSet(name string) {
-	u.selected = name
+	u.fastMu.Lock()
+	defer u.fastMu.Unlock()
+	u.selected.Store(name)
 	u.fastSingle.Reset()
 }
 
@@ -113,26 +118,26 @@ func (u *URLTest) healthCheck() {
 
 func (u *URLTest) fast(touch bool) C.Proxy {
 	elm, _, shared := u.fastSingle.Do(func() (C.Proxy, error) {
+		u.fastMu.Lock()
+		defer u.fastMu.Unlock()
 		proxies := u.GetProxies(touch)
-		if u.selected != "" {
+		if selected := u.selected.Load(); selected != "" {
 			for _, proxy := range proxies {
 				if !proxy.AliveForTestUrl(u.testUrl) {
 					continue
 				}
-				if proxy.Name() == u.selected {
+				if proxy.Name() == selected {
 					u.fastNode = proxy
 					return proxy, nil
 				}
 			}
 		}
 
-		fast := proxies[0]
-		minDelay := fast.LastDelayForTestUrl(u.testUrl)
-		fastNotExist := true
-
-		for _, proxy := range proxies[1:] {
+		var fast, current C.Proxy
+		var minDelay uint16
+		for _, proxy := range proxies {
 			if u.fastNode != nil && proxy.Name() == u.fastNode.Name() {
-				fastNotExist = false
+				current = proxy
 			}
 
 			if !proxy.AliveForTestUrl(u.testUrl) {
@@ -140,17 +145,21 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 			}
 
 			delay := proxy.LastDelayForTestUrl(u.testUrl)
-			if delay < minDelay {
+			if fast == nil || delay < minDelay {
 				fast = proxy
 				minDelay = delay
 			}
-
 		}
-		// tolerance
-		if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) || u.fastNode.LastDelayForTestUrl(u.testUrl) > fast.LastDelayForTestUrl(u.testUrl)+u.tolerance {
-			u.fastNode = fast
+		if fast == nil {
+			fast = current
+			if fast == nil {
+				fast = proxies[0]
+			}
+		} else if current != nil && current.AliveForTestUrl(u.testUrl) && uint32(current.LastDelayForTestUrl(u.testUrl)) <= uint32(minDelay)+uint32(u.tolerance) {
+			fast = current
 		}
-		return u.fastNode, nil
+		u.fastNode = fast
+		return fast, nil
 	})
 	if shared && touch { // a shared fastSingle.Do() may cause providers untouched, so we touch them again
 		u.Touch()
@@ -184,7 +193,7 @@ func (u *URLTest) MarshalJSON() ([]byte, error) {
 		"all":            all,
 		"testUrl":        u.testUrl,
 		"expectedStatus": u.expectedStatus,
-		"fixed":          u.selected,
+		"fixed":          u.selected.Load(),
 		"hidden":         u.Hidden(),
 		"icon":           u.Icon(),
 		"emptyFallback":  u.EmptyFallback().Name(),

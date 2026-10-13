@@ -63,6 +63,11 @@ func SetHealthCheckSuspended(suspended bool) {
 	SetHealthCheckState(suspended, suspended)
 }
 
+func BackgroundHealthChecksPaused() bool {
+	paused, _, _ := backgroundHealthChecks.state()
+	return paused
+}
+
 func SetHealthCheckPriority(priority func() map[string]struct{}) {
 	healthCheckPriority.Store(priority)
 }

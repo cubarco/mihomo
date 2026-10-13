@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/adapter/outbound"
-	"github.com/metacubex/mihomo/common/atomic"
+	"github.com/metacubex/mihomo/adapter/provider"
 	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
@@ -30,7 +30,8 @@ type GroupBase struct {
 	failedTestMux     sync.Mutex
 	failedTimes       int
 	failedTime        time.Time
-	failedTesting     atomic.Bool
+	failedTesting     bool
+	failedCheckAfter  time.Time
 	testTimeout       int
 	maxFailedTimes    int
 	emptyFallback     C.Proxy
@@ -85,7 +86,6 @@ func NewGroupBase(opt GroupBaseOption) *GroupBase {
 		excludeFilterRegs: excludeFilterRegs,
 		excludeTypeArray:  excludeTypeArray,
 		providers:         opt.Providers,
-		failedTesting:     atomic.NewBool(false),
 		testTimeout:       opt.TestTimeout,
 		maxFailedTimes:    opt.MaxFailedTimes,
 		emptyFallback:     opt.EmptyFallback,
@@ -256,18 +256,31 @@ func (gb *GroupBase) URLTest(ctx context.Context, url string, expectedStatus uti
 	var lock sync.Mutex
 	mp := map[string]uint16{}
 	proxies := gb.GetProxies(false)
+	running := make(chan struct{}, groupTestConcurrency)
+schedule:
 	for _, proxy := range proxies {
-		proxy := proxy
+		select {
+		case <-ctx.Done():
+			break schedule
+		case running <- struct{}{}:
+		}
+		if ctx.Err() != nil {
+			<-running
+			break
+		}
 		wg.Add(1)
 		go func() {
+			defer wg.Done()
+			defer func() { <-running }()
+			if ctx.Err() != nil {
+				return
+			}
 			delay, err := proxy.URLTest(ctx, url, expectedStatus)
 			if err == nil {
 				lock.Lock()
 				mp[proxy.Name()] = delay
 				lock.Unlock()
 			}
-
-			wg.Done()
 		}()
 	}
 	wg.Wait()
@@ -284,44 +297,44 @@ func (gb *GroupBase) onDialFailed(adapterType C.AdapterType, err error, fn func(
 		return
 	}
 
-	if errors.Is(err, C.ErrNotSupport) {
+	if err == nil || errors.Is(err, C.ErrNotSupport) || errors.Is(err, context.Canceled) || provider.BackgroundHealthChecksPaused() {
 		return
 	}
 
-	go func() {
-		if strings.Contains(err.Error(), "connection refused") {
-			fn()
+	gb.failedTestMux.Lock()
+	defer gb.failedTestMux.Unlock()
+	now := time.Now()
+	if gb.failedTesting || now.Before(gb.failedCheckAfter) {
+		return
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		if gb.failedTimes == 0 || now.Sub(gb.failedTime) > time.Duration(gb.testTimeout)*time.Millisecond {
+			gb.failedTimes = 0
+			gb.failedTime = now
+		}
+		gb.failedTimes++
+		if gb.failedTimes < gb.maxFailedTimes {
 			return
 		}
-
-		gb.failedTestMux.Lock()
-		defer gb.failedTestMux.Unlock()
-
-		gb.failedTimes++
-		if gb.failedTimes == 1 {
-			log.Debugln("ProxyGroup: %s first failed", gb.Name())
-			gb.failedTime = time.Now()
-		} else {
-			if time.Since(gb.failedTime) > time.Duration(gb.testTimeout)*time.Millisecond {
-				gb.failedTimes = 0
-				return
-			}
-
-			log.Debugln("ProxyGroup: %s failed count: %d", gb.Name(), gb.failedTimes)
-			if gb.failedTimes >= gb.maxFailedTimes {
-				log.Warnln("because %s failed multiple times, activate health check", gb.Name())
-				fn()
-			}
+		log.Warnln("because %s failed multiple times, activate health check", gb.Name())
+	}
+	gb.failedTimes = 0
+	gb.failedTesting = true
+	go func() {
+		defer func() {
+			gb.failedTestMux.Lock()
+			gb.failedTesting = false
+			gb.failedCheckAfter = time.Now().Add(failedCheckCooldown)
+			gb.failedTestMux.Unlock()
+		}()
+		if !provider.BackgroundHealthChecksPaused() {
+			fn()
 		}
 	}()
 }
 
 func (gb *GroupBase) healthCheck() {
-	if gb.failedTesting.Load() {
-		return
-	}
-
-	gb.failedTesting.Store(true)
+	// onDialFailed admits one recovery round before starting its worker.
 	wg := sync.WaitGroup{}
 	for _, proxyProvider := range gb.providers {
 		wg.Add(1)
@@ -337,12 +350,17 @@ func (gb *GroupBase) healthCheck() {
 	}
 
 	wg.Wait()
-	gb.failedTesting.Store(false)
-	gb.failedTimes = 0
 }
 
 func (gb *GroupBase) onDialSuccess() {
-	if !gb.failedTesting.Load() {
+	gb.failedTestMux.Lock()
+	defer gb.failedTestMux.Unlock()
+	if !gb.failedTesting {
 		gb.failedTimes = 0
 	}
 }
+
+const (
+	groupTestConcurrency = 64
+	failedCheckCooldown  = time.Second
+)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/callback"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
@@ -19,7 +20,7 @@ type Fallback struct {
 	*GroupBase
 	disableUDP     bool
 	testUrl        string
-	selected       string
+	selected       atomic.TypedValue[string]
 	expectedStatus string
 }
 
@@ -89,7 +90,7 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
 		"all":            all,
 		"testUrl":        f.testUrl,
 		"expectedStatus": f.expectedStatus,
-		"fixed":          f.selected,
+		"fixed":          f.selected.Load(),
 		"hidden":         f.Hidden(),
 		"icon":           f.Icon(),
 		"emptyFallback":  f.EmptyFallback().Name(),
@@ -104,19 +105,20 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
 
 func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
 	proxies := f.GetProxies(touch)
-	for _, proxy := range proxies {
-		if len(f.selected) == 0 {
-			if proxy.AliveForTestUrl(f.testUrl) {
-				return proxy
-			}
-		} else {
-			if proxy.Name() == f.selected {
+	if selected := f.selected.Load(); selected != "" {
+		for _, proxy := range proxies {
+			if proxy.Name() == selected {
 				if proxy.AliveForTestUrl(f.testUrl) {
 					return proxy
-				} else {
-					f.selected = ""
 				}
+				f.selected.CompareAndSwap(selected, "")
+				break
 			}
+		}
+	}
+	for _, proxy := range proxies {
+		if proxy.AliveForTestUrl(f.testUrl) {
+			return proxy
 		}
 	}
 
@@ -136,7 +138,7 @@ func (f *Fallback) Set(name string) error {
 		return errors.New("proxy not exist")
 	}
 
-	f.selected = name
+	f.selected.Store(name)
 	if !p.AliveForTestUrl(f.testUrl) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(5000))
 		defer cancel()
@@ -148,7 +150,7 @@ func (f *Fallback) Set(name string) error {
 }
 
 func (f *Fallback) ForceSet(name string) {
-	f.selected = name
+	f.selected.Store(name)
 }
 
 func (f *Fallback) Providers() []P.ProxyProvider {

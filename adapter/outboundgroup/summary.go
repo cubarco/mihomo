@@ -19,9 +19,9 @@ func Summary(proxy C.ProxyAdapter) map[string]any {
 			data["testUrl"] = p.testUrl
 		}
 	case *URLTest:
-		data["now"], data["fixed"], data["testUrl"] = p.Now(), p.selected, p.testUrl
+		data["now"], data["fixed"], data["testUrl"] = p.Now(), p.selected.Load(), p.testUrl
 	case *Fallback:
-		data["now"], data["fixed"], data["testUrl"] = p.Now(), p.selected, p.testUrl
+		data["now"], data["fixed"], data["testUrl"] = p.Now(), p.selected.Load(), p.testUrl
 	case *LoadBalance:
 		data["testUrl"] = p.testUrl
 	default:
