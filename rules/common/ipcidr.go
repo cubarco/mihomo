@@ -36,7 +36,7 @@ func (i *IPCIDR) RuleType() C.RuleType {
 }
 
 func (i *IPCIDR) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (bool, string) {
-	if !i.noResolveIP && !i.isSourceIP && helper.ResolveIP != nil {
+	if i.ResolvesIP() && helper.ResolveIP != nil {
 		helper.ResolveIP()
 	}
 
@@ -53,6 +53,14 @@ func (i *IPCIDR) Adapter() string {
 
 func (i *IPCIDR) Payload() string {
 	return i.ipnet.String()
+}
+
+func (i *IPCIDR) Prefix() netip.Prefix {
+	return i.ipnet
+}
+
+func (i *IPCIDR) ResolvesIP() bool {
+	return !i.noResolveIP && !i.isSourceIP
 }
 
 func NewIPCIDR(s string, adapter string, opts ...IPCIDROption) (*IPCIDR, error) {

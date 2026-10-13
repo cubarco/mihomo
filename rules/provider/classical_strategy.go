@@ -64,20 +64,33 @@ func (c *classicalStrategy) payloadToRule(rule string) (C.Rule, error) {
 func (c *classicalStrategy) FinishInsert() {
 	kept := 0
 	for start := 0; start < len(c.rules); {
-		end := start
-		for end < len(c.rules) && isClassicalDomain(c.rules[end]) {
-			end++
+		end := start + 1
+		var compact classicalMatcher
+		if isClassicalDomain(c.rules[start]) {
+			for end < len(c.rules) && isClassicalDomain(c.rules[end]) {
+				end++
+			}
+			if end-start >= minClassicalDomainRun {
+				compact = newClassicalDomainRun(c.rules[start:end])
+			}
+		} else if ip := classicalIPRule(c.rules[start]); ip != nil {
+			for end < len(c.rules) {
+				next := classicalIPRule(c.rules[end])
+				if next == nil || next.RuleType() != ip.RuleType() {
+					break
+				}
+				end++
+			}
+			if end-start >= minClassicalIPRun {
+				compact = newClassicalIPRun(c.rules[start:end], ip.RuleType() == C.SrcIPCIDR)
+			}
 		}
-		if end-start >= minClassicalDomainRun {
-			c.rules[kept] = newClassicalDomainRun(c.rules[start:end])
+		if compact != nil {
+			c.rules[kept] = compact
 			kept++
-			start = end
-			continue
+		} else {
+			kept += copy(c.rules[kept:], c.rules[start:end])
 		}
-		if end == start {
-			end++
-		}
-		kept += copy(c.rules[kept:], c.rules[start:end])
 		start = end
 	}
 	if kept == len(c.rules) {

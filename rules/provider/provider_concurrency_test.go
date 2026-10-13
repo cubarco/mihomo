@@ -2,6 +2,7 @@ package provider
 
 import (
 	"fmt"
+	"net/netip"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -23,16 +24,27 @@ func (t *concurrentRuleTunnel) RuleUpdateCallback() *utils.Callback[P.RuleProvid
 	return &t.callback
 }
 func TestRuleStrategyConcurrentUpdate(t *testing.T) {
-	for _, behavior := range []P.RuleBehavior{P.Domain, P.Classical} {
-		t.Run(behavior.String(), func(t *testing.T) { testRuleStrategyConcurrentUpdate(t, behavior) })
+	for _, tc := range []struct {
+		name     string
+		behavior P.RuleBehavior
+		ip       bool
+	}{
+		{"domain", P.Domain, false},
+		{"classical_domains", P.Classical, false},
+		{"classical_ips", P.Classical, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) { testRuleStrategyConcurrentUpdate(t, tc.behavior, tc.ip) })
 	}
 }
 
-func testRuleStrategyConcurrentUpdate(t *testing.T, behavior P.RuleBehavior) {
+func testRuleStrategyConcurrentUpdate(t *testing.T, behavior P.RuleBehavior, ip bool) {
 	previous := tunnel
 	SetTunnel(&concurrentRuleTunnel{})
 	defer SetTunnel(previous)
 	parse := func(tp, payload, target string, _ []string, _ map[string][]C.Rule) (C.Rule, error) {
+		if tp == "IP-CIDR" {
+			return common.NewIPCIDR(payload, target, common.WithIPCIDRNoResolve(true))
+		}
 		if tp != "DOMAIN" {
 			return nil, fmt.Errorf("unexpected rule type: %s", tp)
 		}
@@ -49,7 +61,11 @@ func testRuleStrategyConcurrentUpdate(t *testing.T, behavior P.RuleBehavior) {
 				prefix = "DOMAIN,"
 			}
 			for rule := range 32 {
-				data = fmt.Appendf(data, "  - '%s%d-%d.example.com'\n", prefix, index, rule)
+				if ip {
+					data = fmt.Appendf(data, "  - 'IP-CIDR,10.%d.%d.0/25,no-resolve'\n", index, rule)
+				} else {
+					data = fmt.Appendf(data, "  - '%s%d-%d.example.com'\n", prefix, index, rule)
+				}
 			}
 			_, _, err := p.SideUpdate(data)
 			if err != nil {
@@ -60,12 +76,12 @@ func testRuleStrategyConcurrentUpdate(t *testing.T, behavior P.RuleBehavior) {
 	group.Go(func() {
 		for range 1000 {
 			_ = p.Count()
-			_ = p.Match(&C.Metadata{Host: "1-0.example.com"}, C.RuleMatchHelper{})
+			_ = p.Match(&C.Metadata{Host: "1-0.example.com", DstIP: netip.MustParseAddr("10.1.0.1")}, C.RuleMatchHelper{})
 			_, _ = p.MarshalJSON()
 		}
 	})
 	group.Wait()
-	if p.Count() != 32 || !p.Match(&C.Metadata{Host: "99-0.example.com"}, C.RuleMatchHelper{}) || p.Match(&C.Metadata{Host: "98-0.example.com"}, C.RuleMatchHelper{}) {
+	if p.Count() != 32 || !p.Match(&C.Metadata{Host: "99-0.example.com", DstIP: netip.MustParseAddr("10.99.0.1")}, C.RuleMatchHelper{}) || p.Match(&C.Metadata{Host: "98-0.example.com", DstIP: netip.MustParseAddr("10.98.0.1")}, C.RuleMatchHelper{}) {
 		t.Fatal("last update was not published")
 	}
 }
