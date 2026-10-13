@@ -64,6 +64,9 @@ func (t *clientImpl) SetLastVisited(last time.Time) {
 func (t *clientImpl) getQuicConn(ctx context.Context) (*quic.Conn, error) {
 	t.connMutex.Lock()
 	defer t.connMutex.Unlock()
+	if t.closed.Load() {
+		return nil, types.ClientClosed
+	}
 	if t.quicConn != nil {
 		return t.quicConn, nil
 	}
@@ -396,6 +399,11 @@ func (t *Client) ListenPacket(ctx context.Context, metadata *C.Metadata) (net.Pa
 
 func (t *Client) forceClose() {
 	t.clientImpl.forceClose(nil, types.ClientClosed)
+}
+
+func (t *Client) ForceClose() {
+	t.closed.Store(true)
+	t.forceClose()
 }
 
 func NewClient(clientOption *ClientOption, udp bool, dialFn types.DialFunc) *Client {

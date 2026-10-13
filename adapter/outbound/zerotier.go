@@ -315,7 +315,6 @@ func NewZeroTier(option ZeroTierOption) (*ZeroTier, error) {
 		dns:                nameServers,
 		ctx:                ctx,
 		cancel:             cancel,
-		frameCh:            make(chan zeroTierInboundFrame, zeroTierFrameQueueSize),
 		configCh:           make(chan struct{}, 1),
 		stateCh:            make(chan struct{}),
 	}
@@ -482,6 +481,9 @@ func (z *ZeroTier) startLocked() error {
 	wireTransport, err := ZTTransport.New(wireConfig)
 	if err != nil {
 		return err
+	}
+	if z.frameCh == nil {
+		z.frameCh = make(chan zeroTierInboundFrame, zeroTierFrameQueueSize)
 	}
 	runtime := &zeroTierRuntime{}
 	var frameDrops struct {
