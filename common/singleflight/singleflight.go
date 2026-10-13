@@ -63,9 +63,7 @@ type call[T any] struct {
 	val T
 	err error
 
-	// These fields are read and written with the singleflight
-	// mutex held before the WaitGroup is done, and are read but
-	// not written after the WaitGroup is done.
+	// Cached calls can gain duplicates after completion; these fields require mu.
 	dups  int
 	chans []chan<- Result[T]
 }
@@ -115,7 +113,10 @@ func (g *Group[T]) Do(key string, fn func() (T, error)) (v T, err error, shared 
 	g.mu.Unlock()
 
 	g.doCall(c, key, fn)
-	return c.val, c.err, c.dups > 0
+	g.mu.Lock()
+	shared = c.dups > 0
+	g.mu.Unlock()
+	return c.val, c.err, shared
 }
 
 // DoChan is like Do but returns a channel that will receive the

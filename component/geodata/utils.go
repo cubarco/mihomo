@@ -136,6 +136,7 @@ func Verify(name string) error {
 }
 
 var loadGeoSiteMatcherListSF = singleflight.Group[[]*router.Domain]{StoreResult: true}
+var loadGeoSiteTransientListSF singleflight.Group[[]*router.Domain]
 var loadGeoSiteMatcherSF = singleflight.Group[router.DomainMatcher]{StoreResult: true}
 
 func LoadGeoSiteMatcher(countryCode string) (router.DomainMatcher, error) {
@@ -168,7 +169,11 @@ func LoadGeoSiteMatcher(countryCode string) (router.DomainMatcher, error) {
 	}
 	matcher, err, shared := loadGeoSiteMatcherSF.Do(matcherName, func() (router.DomainMatcher, error) {
 		log.Infoln("Load GeoSite rule: %s", matcherName)
-		domains, err, shared := loadGeoSiteMatcherListSF.Do(listName, func() ([]*router.Domain, error) {
+		listSF := &loadGeoSiteMatcherListSF
+		if geoLoaderName == "memconservative" {
+			listSF = &loadGeoSiteTransientListSF
+		}
+		domains, err, shared := listSF.Do(listName, func() ([]*router.Domain, error) {
 			geoLoader, err := GetGeoDataLoader(geoLoaderName)
 			if err != nil {
 				return nil, err
@@ -176,8 +181,8 @@ func LoadGeoSiteMatcher(countryCode string) (router.DomainMatcher, error) {
 			return geoLoader.LoadGeoSite(listName)
 		})
 		if err != nil {
-			if !shared {
-				loadGeoSiteMatcherListSF.Forget(listName) // don't store the error result
+			if listSF == &loadGeoSiteMatcherListSF && !shared {
+				listSF.Forget(listName) // don't store the error result
 			}
 			return nil, err
 		}
@@ -266,6 +271,7 @@ func LoadGeoIPMatcher(country string) (router.IPMatcher, error) {
 
 func ClearGeoSiteCache() {
 	loadGeoSiteMatcherListSF.Reset()
+	loadGeoSiteTransientListSF.Reset()
 	loadGeoSiteMatcherSF.Reset()
 }
 
