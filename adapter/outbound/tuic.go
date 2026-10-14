@@ -28,8 +28,7 @@ type Tuic struct {
 	option *TuicOption
 	client *tuic.PoolClient
 
-	configMu   sync.Mutex
-	closed     bool
+	configOnce sync.Once
 	rootCAs    *x509.CertPool
 	quicConfig *quic.Config
 	tlsConfig  *tls.Config
@@ -116,10 +115,7 @@ func (t *Tuic) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_
 }
 
 func (t *Tuic) dial(ctx context.Context) (quicConn *quic.Conn, err error) {
-	tlsConfig, quicConfig, err := t.dialConfigs(ctx)
-	if err != nil {
-		return nil, err
-	}
+	tlsConfig, quicConfig := t.dialConfigs()
 	_, quicConn, err = common.DialQuic(ctx, t.addr, t.DialOptions(), t.dialer, tlsConfig, quicConfig, common.DialQuicOption{Early: t.option.ReduceRtt})
 	if err != nil {
 		return nil, err
@@ -129,10 +125,6 @@ func (t *Tuic) dial(ctx context.Context) (quicConn *quic.Conn, err error) {
 }
 
 func (t *Tuic) Close() error {
-	t.configMu.Lock()
-	t.closed = true
-	t.tlsConfig, t.quicConfig, t.rootCAs = nil, nil, nil
-	t.configMu.Unlock()
 	t.client.Close()
 	return nil
 }

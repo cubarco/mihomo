@@ -1,7 +1,6 @@
 package outbound
 
 import (
-	"runtime"
 	"testing"
 
 	"github.com/metacubex/mihomo/component/ca"
@@ -31,42 +30,6 @@ func BenchmarkTuicConstruction(b *testing.B) {
 				}
 				_ = node.Close()
 			}
-		})
-	}
-}
-
-func TestTuicRetainedHeap(t *testing.T) {
-	ca.GetCertPool()
-	const count = 4096
-	for _, version := range []string{"v4", "v5"} {
-		t.Run(version, func(t *testing.T) {
-			token := ""
-			if version == "v4" {
-				token = "fixture-token"
-			}
-			nodes := make([]*Tuic, count)
-			t.Cleanup(func() {
-				for _, node := range nodes {
-					if node != nil {
-						_ = node.Close()
-					}
-				}
-			})
-			runtime.GC()
-			var before, after runtime.MemStats
-			runtime.ReadMemStats(&before)
-			for i := range nodes {
-				var err error
-				nodes[i], err = NewTuic(tuicMemoryOption(token))
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-			runtime.GC()
-			runtime.ReadMemStats(&after)
-			t.Logf("%d unused nodes: retained heap=%d bytes, objects=%d", count,
-				int64(after.HeapAlloc)-int64(before.HeapAlloc), int64(after.HeapObjects)-int64(before.HeapObjects))
-			runtime.KeepAlive(nodes)
 		})
 	}
 }

@@ -37,7 +37,6 @@ type Hysteria2 struct {
 	option         *Hysteria2Option
 	clientMu       sync.Mutex
 	client         *hysteria2.Client
-	clientErr      error
 	buildClient    func() (*hysteria2.Client, error)
 	closed         bool
 	runCtx         context.Context
@@ -55,10 +54,13 @@ func (h *Hysteria2) lazyClient(ctx context.Context) (*hysteria2.Client, error) {
 		return nil, err
 	}
 	if h.buildClient != nil {
-		h.client, h.clientErr = h.buildClient()
-		h.buildClient = nil
+		client, err := h.buildClient()
+		if err != nil {
+			return nil, err
+		}
+		h.client, h.buildClient = client, nil
 	}
-	return h.client, h.clientErr
+	return h.client, nil
 }
 
 func (h *Hysteria2) requestContext(ctx context.Context) (context.Context, context.CancelFunc) {

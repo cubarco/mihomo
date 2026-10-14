@@ -1,9 +1,7 @@
 package outbound
 
 import (
-	"context"
 	"math"
-	"net"
 	"time"
 
 	"github.com/metacubex/mihomo/ntp"
@@ -12,24 +10,15 @@ import (
 	"github.com/metacubex/tls"
 )
 
-func (t *Tuic) dialConfigs(ctx context.Context) (*tls.Config, *quic.Config, error) {
-	t.configMu.Lock()
-	defer t.configMu.Unlock()
-	if t.closed {
-		return nil, nil, net.ErrClosed
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, nil, err
-	}
-	if t.tlsConfig == nil {
-		t.tlsConfig = newTuicTLSConfig(t.option)
-		t.tlsConfig.RootCAs = t.rootCAs
-		t.rootCAs = nil
-	}
-	if t.quicConfig == nil {
+func (t *Tuic) dialConfigs() (*tls.Config, *quic.Config) {
+	t.configOnce.Do(func() {
+		if t.tlsConfig == nil {
+			t.tlsConfig = newTuicTLSConfig(t.option)
+			t.tlsConfig.RootCAs = t.rootCAs
+		}
 		t.quicConfig = newTuicQUICConfig(t.option)
-	}
-	return t.tlsConfig, t.quicConfig, nil
+	})
+	return t.tlsConfig, t.quicConfig
 }
 
 func newTuicTLSConfig(option *TuicOption) *tls.Config {

@@ -2,12 +2,10 @@ package outbound
 
 import (
 	"context"
-	"errors"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
@@ -20,75 +18,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestTuicLazyConfigLifetime(t *testing.T) {
-	for _, token := range []string{"", "fixture-token"} {
-		node, err := NewTuic(tuicMemoryOption(token))
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = node.Close() })
-		require.Nil(t, node.tlsConfig)
-		require.Nil(t, node.quicConfig)
-		roots := node.rootCAs
-		require.NotNil(t, roots)
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		_, err = node.dial(ctx)
-		require.ErrorIs(t, err, context.Canceled)
-		require.Nil(t, node.tlsConfig)
-		require.Nil(t, node.quicConfig)
-
-		configs := make(chan *tls.Config, 32)
-		var wg sync.WaitGroup
-		for range cap(configs) {
-			wg.Go(func() {
-				tlsConfig, quicConfig, err := node.dialConfigs(context.Background())
-				if err != nil || quicConfig == nil {
-					t.Errorf("first config: %v", err)
-				}
-				configs <- tlsConfig
-			})
-		}
-		wg.Wait()
-		close(configs)
-		for config := range configs {
-			require.Same(t, node.tlsConfig, config)
-		}
-		require.Same(t, roots, node.tlsConfig.RootCAs)
-		require.Nil(t, node.rootCAs)
-		snapshot := node.tlsConfig
-		require.NoError(t, node.Close())
-		require.Nil(t, node.tlsConfig)
-		require.Nil(t, node.quicConfig)
-		require.Equal(t, "proxy.test", snapshot.ServerName)
-		_, _, err = node.dialConfigs(context.Background())
-		require.ErrorIs(t, err, net.ErrClosed)
-	}
-}
-
-func TestTuicConfigCloseRace(t *testing.T) {
-	node, err := NewTuic(tuicMemoryOption(""))
-	require.NoError(t, err)
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-	for range 32 {
-		wg.Go(func() {
-			<-start
-			tlsConfig, quicConfig, err := node.dialConfigs(context.Background())
-			if err != nil && !errors.Is(err, net.ErrClosed) {
-				t.Error(err)
-			}
-			if err == nil && (tlsConfig.ServerName != "proxy.test" || !quicConfig.EnableDatagrams) {
-				t.Error("close changed an acquired configuration")
-			}
-		})
-	}
-	wg.Go(func() { <-start; _ = node.Close() })
-	close(start)
-	wg.Wait()
-	require.Nil(t, node.tlsConfig)
-	require.Nil(t, node.quicConfig)
-	require.Nil(t, node.rootCAs)
-}
-
 func TestTuicConfigOptions(t *testing.T) {
 	for _, alpn := range [][]string{nil, {}, {"custom"}} {
 		option := tuicMemoryOption("")
@@ -96,8 +25,8 @@ func TestTuicConfigOptions(t *testing.T) {
 		node, err := NewTuic(option)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = node.Close() })
-		tlsConfig, config, err := node.dialConfigs(context.Background())
-		require.NoError(t, err)
+		require.Nil(t, node.quicConfig)
+		tlsConfig, config := node.dialConfigs()
 		wantALPN := alpn
 		if wantALPN == nil {
 			wantALPN = []string{"h3"}
@@ -119,8 +48,7 @@ func TestTuicConfigOptions(t *testing.T) {
 	node, err := NewTuic(option)
 	require.NoError(t, err)
 	defer node.Close()
-	_, config, err := node.dialConfigs(context.Background())
-	require.NoError(t, err)
+	_, config := node.dialConfigs()
 	require.Equal(t, uint64(2048), config.InitialStreamReceiveWindow)
 	require.Equal(t, uint64(2048), config.MaxStreamReceiveWindow)
 	require.Equal(t, uint64(4096), config.InitialConnectionReceiveWindow)
@@ -212,11 +140,9 @@ func TestTuicClientCertificateKeepsParsedLoader(t *testing.T) {
 	defer node.Close()
 	parsed := node.tlsConfig
 	require.NotNil(t, parsed)
-	require.Nil(t, node.quicConfig)
 	require.NoError(t, os.Remove(option.Certificate))
 	require.NoError(t, os.Remove(option.PrivateKey))
-	config, _, err := node.dialConfigs(context.Background())
-	require.NoError(t, err)
+	config, _ := node.dialConfigs()
 	require.Same(t, parsed, config)
 	loaded, err := config.GetClientCertificate(&tls.CertificateRequestInfo{})
 	require.NoError(t, err)
