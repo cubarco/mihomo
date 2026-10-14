@@ -127,11 +127,15 @@ func (p *Proxy) LastDelayForTestUrl(url string) (delay uint16) {
 
 // MarshalJSON implements C.ProxyAdapter
 func (p *Proxy) MarshalJSON() ([]byte, error) {
+	return p.appendJSON(nil)
+}
+
+func (p *Proxy) appendJSON(dst []byte) ([]byte, error) {
 	inner, err := p.ProxyAdapter.MarshalJSON()
 	if err != nil {
 		return inner, err
 	}
-	if merged, ok := p.appendMergedJSON(nil, inner); ok {
+	if merged, ok := p.appendMergedJSON(dst, inner); ok {
 		return merged, nil
 	}
 
@@ -154,7 +158,11 @@ func (p *Proxy) MarshalJSON() ([]byte, error) {
 	mapping["provider-name"] = proxyInfo.ProviderName
 	mapping["dialer-proxy"] = proxyInfo.DialerProxy
 
-	return json.Marshal(mapping)
+	data, err := json.Marshal(mapping)
+	if dst == nil || err != nil {
+		return data, err
+	}
+	return append(dst, data...), nil
 }
 
 func (p *Proxy) urlTestOnce(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (t uint16, err error) {

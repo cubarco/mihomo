@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -105,6 +106,17 @@ func TestProxyJSONMatchesLegacyEncoding(t *testing.T) {
 					got, gotErr := p.MarshalJSON()
 					require.Equal(t, wantErr, gotErr)
 					require.Equal(t, string(want), string(got))
+					for _, size := range []int{16, 4096} {
+						var output bytes.Buffer
+						writer := bufio.NewWriterSize(&output, size)
+						_, err := writer.WriteString(`{"node":`)
+						require.NoError(t, err)
+						require.NoError(t, WriteProxyJSON(writer, p))
+						_, err = writer.WriteString("}\n")
+						require.NoError(t, err)
+						require.NoError(t, writer.Flush())
+						require.Equal(t, `{"node":`+string(want)+"}\n", output.String())
+					}
 					for _, url := range []string{"https://b.test/?a=<&>", "https://a.test/香港"} {
 						recordJSONProbe(p, url, round)
 					}

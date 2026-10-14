@@ -1,7 +1,9 @@
 package provider
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -56,6 +58,9 @@ func TestProxySubscriptionMetadataConcurrentUpdate(t *testing.T) {
 				t.Error("invalid metadata snapshot")
 			}
 			if _, err := provider.MarshalJSON(); err != nil {
+				t.Error(err)
+			}
+			if err := WriteJSON(context.Background(), io.Discard, provider); err != nil {
 				t.Error(err)
 			}
 		}

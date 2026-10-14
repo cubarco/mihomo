@@ -133,7 +133,11 @@ type proxySetProvider struct {
 }
 
 func (pp *proxySetProvider) MarshalJSON() ([]byte, error) {
-	return json.Marshal(providerForApi{
+	return json.Marshal(pp.apiSnapshot())
+}
+
+func (pp *proxySetProvider) apiSnapshot() providerForApi {
+	return providerForApi{
 		Name:             pp.Name(),
 		Type:             pp.Type().String(),
 		VehicleType:      pp.VehicleType().String(),
@@ -142,7 +146,7 @@ func (pp *proxySetProvider) MarshalJSON() ([]byte, error) {
 		ExpectedStatus:   pp.healthCheck.expectedStatus.String(),
 		UpdatedAt:        pp.UpdatedAt(),
 		SubscriptionInfo: pp.subscriptionInfo.Load(),
-	})
+	}
 }
 
 func (pp *proxySetProvider) Name() string {
@@ -247,15 +251,21 @@ type inlineProvider struct {
 }
 
 func (ip *inlineProvider) MarshalJSON() ([]byte, error) {
-	return json.Marshal(providerForApi{
+	return json.Marshal(ip.apiSnapshot())
+}
+
+func (ip *inlineProvider) apiSnapshot() providerForApi {
+	ip.mutex.RLock()
+	defer ip.mutex.RUnlock()
+	return providerForApi{
 		Name:           ip.Name(),
 		Type:           ip.Type().String(),
 		VehicleType:    ip.VehicleType().String(),
-		Proxies:        ip.Proxies(),
+		Proxies:        ip.proxies,
 		TestUrl:        ip.healthCheck.url,
 		ExpectedStatus: ip.healthCheck.expectedStatus.String(),
 		UpdatedAt:      ip.updateAt,
-	})
+	}
 }
 
 func (ip *inlineProvider) VehicleType() P.VehicleType {
@@ -264,7 +274,9 @@ func (ip *inlineProvider) VehicleType() P.VehicleType {
 
 func (ip *inlineProvider) Update() error {
 	// make api update happy
+	ip.mutex.Lock()
 	ip.updateAt = time.Now()
+	ip.mutex.Unlock()
 	return nil
 }
 
@@ -309,14 +321,18 @@ type compatibleProvider struct {
 }
 
 func (cp *compatibleProvider) MarshalJSON() ([]byte, error) {
-	return json.Marshal(providerForApi{
+	return json.Marshal(cp.apiSnapshot())
+}
+
+func (cp *compatibleProvider) apiSnapshot() providerForApi {
+	return providerForApi{
 		Name:           cp.Name(),
 		Type:           cp.Type().String(),
 		VehicleType:    cp.VehicleType().String(),
 		Proxies:        cp.Proxies(),
 		TestUrl:        cp.healthCheck.url,
 		ExpectedStatus: cp.healthCheck.expectedStatus.String(),
-	})
+	}
 }
 
 func (cp *compatibleProvider) Update() error {

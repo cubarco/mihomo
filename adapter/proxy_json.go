@@ -4,12 +4,40 @@ import (
 	"bytes"
 	"cmp"
 	"encoding/json"
+	"io"
+	"reflect"
 	"slices"
 	"strconv"
 	"unicode/utf8"
 
 	C "github.com/metacubex/mihomo/constant"
 )
+
+// WriteProxyJSON reuses a buffered writer's free space for ordinary proxies.
+func WriteProxyJSON(w io.Writer, proxy C.Proxy) error {
+	var data []byte
+	var err error
+	if p, ok := proxy.(*Proxy); ok && p != nil {
+		if buffered, ok := w.(interface{ AvailableBuffer() []byte }); ok {
+			data = buffered.AvailableBuffer()
+		}
+		data, err = p.appendJSON(data)
+		if err != nil {
+			err = &json.MarshalerError{Type: reflect.TypeFor[C.Proxy](), Err: err}
+		}
+	} else {
+		// Keep the interface marshaler's validation, escaping and error type.
+		data, err = json.Marshal(&proxy)
+	}
+	if err != nil {
+		return err
+	}
+	n, err := w.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	return err
+}
 
 func (p *Proxy) appendMergedJSON(b, inner []byte) (out []byte, ok bool) {
 	members, ok := canonicalMembers(inner)

@@ -60,10 +60,7 @@ func findProxyByName(next http.Handler) http.Handler {
 }
 
 func getProxies(w http.ResponseWriter, r *http.Request) {
-	proxies := tunnel.Proxies()
-	render.JSON(w, r, render.M{
-		"proxies": proxies,
-	})
+	writeProxiesJSON(w, r, tunnel.Proxies())
 }
 
 func getProxy(w http.ResponseWriter, r *http.Request) {
