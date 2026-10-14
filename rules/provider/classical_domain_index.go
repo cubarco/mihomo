@@ -2,8 +2,11 @@ package provider
 
 import (
 	"hash/maphash"
+	"math"
 	"math/bits"
 	"slices"
+	"sort"
+	"strings"
 
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/rules/common"
@@ -12,7 +15,8 @@ import (
 const minClassicalDomainRun = 16
 
 type classicalNameTable struct {
-	names  []string
+	arena  string
+	ends   []uint32
 	slots  []uint32
 	maxLen int
 }
@@ -20,11 +24,11 @@ type classicalNameTable struct {
 func newClassicalNameTable(names []string, seed maphash.Seed) classicalNameTable {
 	slices.Sort(names)
 	names = slices.Compact(names)
-	if len(names) < cap(names)/2 {
-		names = slices.Clone(names)
-	}
-	table := classicalNameTable{names: names}
-	for _, name := range names {
+	table := classicalNameTable{arena: strings.Join(names, ""), ends: make([]uint32, len(names))}
+	end := 0
+	for i, name := range names {
+		end += len(name)
+		table.ends[i] = uint32(end)
 		table.maxLen = max(table.maxLen, len(name))
 	}
 	if len(names) < minClassicalDomainRun {
@@ -47,13 +51,21 @@ func newClassicalNameTable(names []string, seed maphash.Seed) classicalNameTable
 	return table
 }
 
+func (t *classicalNameTable) name(i int) string {
+	start := uint32(0)
+	if i > 0 {
+		start = t.ends[i-1]
+	}
+	return t.arena[start:t.ends[i]]
+}
+
 func (t *classicalNameTable) has(name string, seed maphash.Seed) bool {
 	if len(name) > t.maxLen {
 		return false
 	}
 	if len(t.slots) == 0 {
-		_, found := slices.BinarySearch(t.names, name)
-		return found
+		i := sort.Search(len(t.ends), func(i int) bool { return t.name(i) >= name })
+		return i < len(t.ends) && t.name(i) == name
 	}
 	mask := uint64(len(t.slots) - 1)
 	for pos := maphash.String(seed, name) & mask; ; pos = (pos + 1) & mask {
@@ -61,7 +73,7 @@ func (t *classicalNameTable) has(name string, seed maphash.Seed) bool {
 		if index == 0 {
 			return false
 		}
-		if t.names[index-1] == name {
+		if t.name(int(index-1)) == name {
 			return true
 		}
 	}
@@ -83,12 +95,19 @@ func isClassicalDomain(rule classicalMatcher) bool {
 
 // Only adjacent standard domain rules can share an index: other rules may
 // resolve DNS, look up a process or change the metadata used by later rules.
-func newClassicalDomainRun(rules []classicalMatcher) *classicalDomainRun {
-	var exact int
+func newClassicalDomainRun(rules []classicalMatcher) classicalMatcher {
+	var exact, size int
 	for _, rule := range rules {
-		if _, ok := rule.(*common.Domain); ok {
+		switch r := rule.(type) {
+		case *common.Domain:
 			exact++
+			size += len(r.Payload())
+		case *common.DomainSuffix:
+			size += len(r.Payload())
 		}
+	}
+	if uint64(size) > math.MaxUint32 {
+		return nil
 	}
 	domains := make([]string, 0, exact)
 	suffixes := make([]string, 0, len(rules)-exact)
@@ -111,7 +130,7 @@ func (r *classicalDomainRun) Match(metadata *C.Metadata, _ C.RuleMatchHelper) (b
 	if r.domains.has(host, r.seed) || r.suffixes.has(host, r.seed) {
 		return true, ""
 	}
-	if len(r.suffixes.names) > 0 {
+	if len(r.suffixes.ends) > 0 {
 		for i := max(0, len(host)-r.suffixes.maxLen-1); i < len(host); i++ {
 			if host[i] == '.' && r.suffixes.has(host[i+1:], r.seed) {
 				return true, ""

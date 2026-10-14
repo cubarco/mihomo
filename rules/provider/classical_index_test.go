@@ -130,22 +130,54 @@ func TestClassicalIndexKeepsSideEffectBoundaries(t *testing.T) {
 	}
 }
 
-func TestClassicalIndexSmallAndDuplicateRuns(t *testing.T) {
-	for _, count := range []int{0, 1, 15, 16, 17, 64, 4096} {
-		for _, line := range []string{"DOMAIN,one.test", "DOMAIN-SUFFIX,one.test"} {
-			lines := make([]string, count)
-			for i := range lines {
-				lines[i] = line
+func TestClassicalIndexLifecycle(t *testing.T) {
+	probes := []C.Metadata{
+		{}, {Host: "one.test"}, {Host: "sub.one.test"}, {Host: "one.test."}, {Host: "notone.test"},
+		{DstIP: netip.MustParseAddr("192.0.2.1")}, {DstIP: netip.MustParseAddr("198.51.100.1")},
+	}
+	for _, tc := range []struct {
+		line, late, fresh string
+		lateHit, freshHit C.Metadata
+	}{
+		{"DOMAIN,one.test", "DOMAIN,late.test", "DOMAIN,fresh.test", C.Metadata{Host: "late.test"}, C.Metadata{Host: "fresh.test"}},
+		{"DOMAIN-SUFFIX,one.test", "DOMAIN-SUFFIX,late.test", "DOMAIN,fresh.test", C.Metadata{Host: "a.late.test"}, C.Metadata{Host: "fresh.test"}},
+		{"IP-CIDR,192.0.2.0/24,no-resolve", "SRC-IP-CIDR,198.51.100.0/24", "IP-CIDR,203.0.113.0/24,no-resolve",
+			C.Metadata{SrcIP: netip.MustParseAddr("198.51.100.1")}, C.Metadata{DstIP: netip.MustParseAddr("203.0.113.1")}},
+	} {
+		for _, count := range []int{0, 1, 15, 16, 17, 64, 4096} {
+			lines := slices.Repeat([]string{tc.line}, count)
+			s := RP.NewClassicalStrategy(rules.ParseRule)
+			for _, line := range lines {
+				s.Insert(line)
 			}
-			reference, indexed := loadClassical(lines, false), loadClassical(lines, true)
-			for _, host := range []string{"", "one.test", "sub.one.test", "one.test.", "notone.test"} {
-				compareClassical(t, reference, indexed, C.Metadata{Host: host})
+			s.FinishInsert()
+			s.FinishInsert()
+			reference := loadClassical(lines, false)
+			for _, probe := range probes {
+				compareClassical(t, reference, s, probe)
+			}
+			matches := func(m C.Metadata) bool { return s.Match(&m, C.RuleMatchHelper{}) }
+			for range 16 {
+				s.Insert(tc.late)
+			}
+			if !matches(tc.lateHit) {
+				t.Fatalf("%s x%d: late insertion was lost", tc.line, count)
+			}
+			s.FinishInsert()
+			if s.Count() != count+16 || !matches(tc.lateHit) {
+				t.Fatalf("%s x%d: finishing again lost the appended run", tc.line, count)
+			}
+			s.Reset()
+			s.Insert(tc.fresh)
+			s.FinishInsert()
+			if s.Count() != 1 || !matches(tc.freshHit) || matches(tc.lateHit) || slices.ContainsFunc(probes, matches) {
+				t.Fatalf("%s x%d: reset retained an old index", tc.line, count)
 			}
 		}
 	}
 }
 
-func TestClassicalIndexRespectsParserAndLateInserts(t *testing.T) {
+func TestClassicalIndexRespectsParser(t *testing.T) {
 	calls := 0
 	parse := func(tp, payload, target string, params []string, subRules map[string][]C.Rule) (C.Rule, error) {
 		calls++
@@ -163,7 +195,6 @@ func TestClassicalIndexRespectsParserAndLateInserts(t *testing.T) {
 		s.Insert(line)
 	}
 	s.FinishInsert()
-	s.FinishInsert()
 	if calls != len(lines) || s.Count() != len(lines)-1 {
 		t.Fatalf("parser calls=%d count=%d", calls, s.Count())
 	}
@@ -171,17 +202,6 @@ func TestClassicalIndexRespectsParserAndLateInserts(t *testing.T) {
 		if got := s.Match(&C.Metadata{Host: host}, C.RuleMatchHelper{}); got != want {
 			t.Fatalf("custom parser: %s = %v, want %v", host, got, want)
 		}
-	}
-	s.Insert("DOMAIN,late.test")
-	if !s.Match(&C.Metadata{Host: "late.test"}, C.RuleMatchHelper{}) {
-		t.Fatal("late insertion was lost")
-	}
-	s.FinishInsert()
-	s.Reset()
-	s.Insert("DOMAIN,fresh.test")
-	s.FinishInsert()
-	if s.Count() != 1 || !s.Match(&C.Metadata{Host: "fresh.test"}, C.RuleMatchHelper{}) || s.Match(&C.Metadata{Host: "actual.test"}, C.RuleMatchHelper{}) {
-		t.Fatal("reset retained an old index")
 	}
 }
 
@@ -206,27 +226,40 @@ func TestClassicalIndexHonorsMetadataChanges(t *testing.T) {
 	}
 }
 
+func measureRetained(load func() classicalMatcher) (classicalMatcher, int64, int64) {
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	s := load()
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	return s, int64(after.HeapAlloc) - int64(before.HeapAlloc), int64(after.HeapObjects) - int64(before.HeapObjects)
+}
+
 func TestClassicalIndexRetainedStorage(t *testing.T) {
 	const count = 20000
-	lines := classicalLines(count)
-	measure := func(finish bool) (classicalMatcher, int64, int64) {
-		runtime.GC()
-		var before, after runtime.MemStats
-		runtime.ReadMemStats(&before)
-		s := loadClassical(lines, finish)
-		runtime.GC()
-		runtime.ReadMemStats(&after)
-		return s, int64(after.HeapAlloc) - int64(before.HeapAlloc), int64(after.HeapObjects) - int64(before.HeapObjects)
+	for _, tc := range []struct {
+		name          string
+		lines         func() []string
+		budgetPercent int64
+	}{
+		{"domain", func() []string { return classicalLines(count) }, 50},
+		{"disjoint IP", func() []string { return classicalIPLines(count) }, 75},
+		{"overlapping IP", func() []string {
+			lines := classicalIPLines(count)
+			lines[count-1] = "IP-CIDR,10.0.0.0/8,no-resolve"
+			return lines
+		}, 10},
+	} {
+		linear, linearBytes, linearObjects := measureRetained(func() classicalMatcher { return loadClassical(tc.lines(), false) })
+		indexed, indexedBytes, indexedObjects := measureRetained(func() classicalMatcher { return loadClassical(tc.lines(), true) })
+		t.Logf("%d %s rules: linear %d live bytes / %d objects; indexed %d live bytes / %d objects", count, tc.name, linearBytes, linearObjects, indexedBytes, indexedObjects)
+		if indexedBytes*100 > linearBytes*tc.budgetPercent || indexedObjects > linearObjects/4 {
+			t.Errorf("%s index retained per-rule objects or oversized storage", tc.name)
+		}
+		runtime.KeepAlive(linear)
+		runtime.KeepAlive(indexed)
 	}
-	linear, linearBytes, linearObjects := measure(false)
-	indexed, indexedBytes, indexedObjects := measure(true)
-	t.Logf("%d rules: linear %d live bytes / %d objects; indexed %d live bytes / %d objects", count, linearBytes, linearObjects, indexedBytes, indexedObjects)
-	if indexedBytes > linearBytes*3/4 || indexedObjects > linearObjects/4 {
-		t.Error("index did not release per-rule objects and reduce retained storage")
-	}
-	runtime.KeepAlive(linear)
-	runtime.KeepAlive(indexed)
-	runtime.KeepAlive(lines)
 }
 
 func BenchmarkClassicalDomainRules(b *testing.B) {

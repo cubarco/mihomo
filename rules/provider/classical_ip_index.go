@@ -19,7 +19,7 @@ type classicalIPRun struct {
 
 func classicalIPRule(rule classicalMatcher) *common.IPCIDR {
 	r, ok := rule.(*common.IPCIDR)
-	if !ok || r == nil || r.ResolvesIP() || !r.Prefix().IsValid() {
+	if !ok || r == nil || r.ResolvesIP() {
 		return nil
 	}
 	return r

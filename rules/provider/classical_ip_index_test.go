@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net/netip"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -161,71 +160,6 @@ func TestClassicalIPIndexHonorsParserAndMetadataChanges(t *testing.T) {
 	s.FinishInsert()
 	if !s.Match(&C.Metadata{DstIP: netip.MustParseAddr("192.0.2.1")}, C.RuleMatchHelper{}) || s.Match(&C.Metadata{DstIP: netip.MustParseAddr("198.51.100.8")}, C.RuleMatchHelper{}) {
 		t.Fatal("index ignored the parser's rewritten prefix")
-	}
-}
-
-func TestClassicalIPIndexSmallRunsAndLateInserts(t *testing.T) {
-	for _, count := range []int{0, 1, 15, 16, 17, 4096} {
-		lines := slices.Repeat([]string{"IP-CIDR,192.0.2.0/24,no-resolve"}, count)
-		s := RP.NewClassicalStrategy(rules.ParseRule)
-		for _, line := range lines {
-			s.Insert(line)
-		}
-		s.FinishInsert()
-		s.FinishInsert()
-		for _, address := range []string{"192.0.2.1", "198.51.100.1"} {
-			compareClassical(t, loadClassical(lines, false), s, C.Metadata{DstIP: netip.MustParseAddr(address)})
-		}
-		for range 16 {
-			s.Insert("SRC-IP-CIDR,198.51.100.0/24")
-		}
-		if !s.Match(&C.Metadata{SrcIP: netip.MustParseAddr("198.51.100.1")}, C.RuleMatchHelper{}) {
-			t.Fatal("late insertion was lost")
-		}
-		s.FinishInsert()
-		if s.Count() != count+16 || !s.Match(&C.Metadata{SrcIP: netip.MustParseAddr("198.51.100.1")}, C.RuleMatchHelper{}) {
-			t.Fatal("finishing again lost the appended IP run")
-		}
-		s.Reset()
-		s.Insert("IP-CIDR,203.0.113.0/24,no-resolve")
-		s.FinishInsert()
-		if s.Count() != 1 || !s.Match(&C.Metadata{DstIP: netip.MustParseAddr("203.0.113.1")}, C.RuleMatchHelper{}) || s.Match(&C.Metadata{DstIP: netip.MustParseAddr("192.0.2.1"), SrcIP: netip.MustParseAddr("198.51.100.1")}, C.RuleMatchHelper{}) {
-			t.Fatal("reset retained an old IP index")
-		}
-	}
-}
-
-func TestClassicalIPIndexRetainedStorage(t *testing.T) {
-	const count = 20000
-	for _, name := range []string{"disjoint", "overlapping"} {
-		t.Run(name, func(t *testing.T) {
-			lines := classicalIPLines(count)
-			if name == "overlapping" {
-				lines[count-1] = "IP-CIDR,10.0.0.0/8,no-resolve"
-			}
-			measure := func(finish bool) (classicalMatcher, int64, int64) {
-				runtime.GC()
-				var before, after runtime.MemStats
-				runtime.ReadMemStats(&before)
-				s := loadClassical(lines, finish)
-				runtime.GC()
-				runtime.ReadMemStats(&after)
-				return s, int64(after.HeapAlloc) - int64(before.HeapAlloc), int64(after.HeapObjects) - int64(before.HeapObjects)
-			}
-			linear, linearBytes, linearObjects := measure(false)
-			indexed, indexedBytes, indexedObjects := measure(true)
-			t.Logf("%d %s IP rules: linear %d live bytes / %d objects; indexed %d live bytes / %d objects", count, name, linearBytes, linearObjects, indexedBytes, indexedObjects)
-			budget := linearBytes * 3 / 4
-			if name == "overlapping" {
-				budget = linearBytes / 10
-			}
-			if indexedBytes > budget || indexedObjects > linearObjects/4 {
-				t.Error("index retained per-rule objects or an oversized range array")
-			}
-			runtime.KeepAlive(linear)
-			runtime.KeepAlive(indexed)
-			runtime.KeepAlive(lines)
-		})
 	}
 }
 
