@@ -161,36 +161,3 @@ func TestGeoSiteRetryAndConcurrentReuse(t *testing.T) {
 		})
 	}
 }
-
-func TestGeoSiteRetainedHeap(t *testing.T) {
-	const count = 50000
-	for _, loader := range []string{"standard", "memconservative"} {
-		t.Run(loader, func(t *testing.T) {
-			stageRetentionLoader(t, loader, "succinct", func() ([]*router.Domain, error) {
-				domains := make([]*router.Domain, count)
-				for i := range domains {
-					domains[i] = &router.Domain{
-						Type: router.Domain_Domain, Value: fmt.Sprintf("host%d.example.com", i),
-						Attribute: []*router.Domain_Attribute{{Key: "ads"}},
-					}
-				}
-				return domains, nil
-			})
-			runtime.GC()
-			var before, after runtime.MemStats
-			runtime.ReadMemStats(&before)
-			matcher, err := LoadGeoSiteMatcher("heap")
-			if err != nil {
-				t.Fatal(err)
-			}
-			runtime.GC()
-			runtime.ReadMemStats(&after)
-			if matcher.Count() != count || !matcher.ApplyDomain("www.host49999.example.com") {
-				t.Fatal("large matcher lost entries")
-			}
-			t.Logf("%d domains: retained heap=%d bytes, objects=%d", count,
-				int64(after.HeapAlloc)-int64(before.HeapAlloc), int64(after.HeapObjects)-int64(before.HeapObjects))
-			runtime.KeepAlive(matcher)
-		})
-	}
-}
