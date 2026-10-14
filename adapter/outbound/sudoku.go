@@ -96,9 +96,6 @@ func (s *Sudoku) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Con
 
 // ListenPacketContext implements C.ProxyAdapter
 func (s *Sudoku) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
 	if err := s.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}

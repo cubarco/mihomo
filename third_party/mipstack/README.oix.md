@@ -23,3 +23,5 @@ go test -tags with_mips_low_memory -run '^$' -bench BenchmarkTCPMemoryProfileStr
 The deterministic profile counts retained backing, not Android RSS. Upstream's iPad measurements in LOW_MEMORY.md describe its own workload. The separate upstream gVisor interoperability race suite had unresolved timeouts; the application TUN tests here are a different suite.
 
 Updated to 961d4b1c1983 for packet batch input, RX checksum offload, ICMPv6 and TCP correctness fixes. The storage policy remains a local patch; the benchmark helper also keeps the newer IPv6/offload parameters.
+
+`ValidateConfig` in config.go is a local addition that exposes the configuration checks of `New`; the mihomo MASQUE outbound uses it to decide whether to build its IP stack at load time. Keep it when updating the source.

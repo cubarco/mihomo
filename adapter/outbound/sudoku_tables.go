@@ -26,8 +26,8 @@ type sudokuTableSpec struct {
 }
 
 func newSudokuTableSpec(seed, tableType, customTable string, customTables []string) (sudokuTableSpec, error) {
-	patterns := sudoku.ClientTablePatterns(customTable, customTables)
-	if err := sudoku.ValidateClientTablePatterns(tableType, "", patterns); err != nil {
+	patterns, err := sudoku.ClientTablePatterns(tableType, customTable, customTables)
+	if err != nil {
 		return sudokuTableSpec{}, err
 	}
 	var identity strings.Builder
@@ -50,9 +50,6 @@ type sudokuTables struct {
 }
 
 func (t *sudokuTables) fill(ctx context.Context, conf *sudoku.ProtocolConfig) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	set := t.set.Load()
 	if set == nil {
 		shared, err := sharedSudokuTables(ctx, t.spec)
@@ -61,9 +58,6 @@ func (t *sudokuTables) fill(ctx context.Context, conf *sudoku.ProtocolConfig) er
 		}
 		t.set.CompareAndSwap(nil, shared)
 		set = t.set.Load()
-	}
-	if err := ctx.Err(); err != nil {
-		return err
 	}
 	if len(set.tables) == 1 {
 		conf.Table, conf.Tables = set.tables[0], nil

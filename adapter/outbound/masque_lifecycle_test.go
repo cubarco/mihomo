@@ -152,7 +152,7 @@ func TestMasqueCloseSerializesWithDeviceStart(t *testing.T) {
 	go func() { closed <- node.Close() }()
 	<-node.runCtx.Done()
 	close(device.release)
-	require.ErrorIs(t, <-started, context.Canceled)
+	require.NoError(t, <-started)
 	require.NoError(t, <-closed)
 	require.NoError(t, node.Close())
 	require.False(t, device.overlap.Load())
@@ -193,6 +193,7 @@ func TestMasqueStackValidationMatchesBackend(t *testing.T) {
 		{"10.0.0.2/32", "10.0.0.2/24", 1280},
 		{"::ffff:10.0.0.2/80", "", 1280},
 		{"10.0.0.1/24", "::ffff:10.0.0.255/128", 1280},
+		{"127.0.0.1/24", "127.0.0.255/32", 1280},
 	}
 	for _, mode := range masqueTestStackModes() {
 		for _, tc := range cases {

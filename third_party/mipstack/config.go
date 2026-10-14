@@ -243,6 +243,13 @@ func (state *networkState) sameSourceProperties(other *networkState) bool {
 	return true
 }
 
+// ValidateConfig returns the configuration error New would report, without
+// constructing a stack.
+func ValidateConfig(config Config) error {
+	_, err := buildNetworkState(config)
+	return err
+}
+
 // buildNetworkState validates and normalizes one public configuration.
 func buildNetworkState(config Config) (*networkState, error) {
 	mtu := int(config.MTU)

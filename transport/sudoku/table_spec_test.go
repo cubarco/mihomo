@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestValidateClientTablePatternsMatchesBuilder(t *testing.T) {
+func TestClientTablePatternsMatchesBuilder(t *testing.T) {
 	for _, tc := range []struct {
 		mode     string
 		pattern  string
@@ -29,10 +29,11 @@ func TestValidateClientTablePatternsMatchesBuilder(t *testing.T) {
 		{"up_entropy_down_ascii", "", []string{"xxpp"}},
 	} {
 		t.Run(fmt.Sprintf("%s/%s/%v", tc.mode, tc.pattern, tc.rotation), func(t *testing.T) {
-			_, buildErr := NewClientTablesWithCustomPatterns("validation-fixture", tc.mode, tc.pattern, tc.rotation)
-			validationErr := ValidateClientTablePatterns(tc.mode, tc.pattern, tc.rotation)
+			tables, buildErr := NewClientTablesWithCustomPatterns("validation-fixture", tc.mode, tc.pattern, tc.rotation)
+			patterns, validationErr := ClientTablePatterns(tc.mode, tc.pattern, tc.rotation)
 			if buildErr == nil {
 				require.NoError(t, validationErr)
+				require.Len(t, patterns, len(tables))
 			} else {
 				require.EqualError(t, validationErr, buildErr.Error())
 			}
