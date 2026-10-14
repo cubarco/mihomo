@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"reflect"
 	"sync"
 	"time"
 
@@ -408,17 +409,41 @@ func (r *Resolver) ClearCache() {
 }
 
 func (r *Resolver) ResetConnection() {
-	if r != nil {
-		for _, c := range r.main {
-			c.ResetConnection()
-		}
-		for _, c := range r.fallback {
-			c.ResetConnection()
-		}
-		if dr := r.defaultResolver; dr != nil {
-			dr.ResetConnection()
-		}
+	r.resetConnections(make(map[dnsClient]struct{}))
+}
+
+func (r *Resolver) resetConnections(seen map[dnsClient]struct{}) {
+	if r == nil {
+		return
 	}
+	resetOnce := func(c dnsClient) {
+		raw := rawTransport(c)
+		if raw == nil {
+			return
+		}
+		typ := reflect.TypeOf(raw)
+		comparable := typ.Comparable()
+		if comparable && (typ.Kind() == reflect.Struct || typ.Kind() == reflect.Array) {
+			comparable = reflect.ValueOf(raw).Comparable()
+		}
+		if comparable {
+			if _, done := seen[raw]; done {
+				return
+			}
+			seen[raw] = struct{}{}
+		}
+		raw.ResetConnection()
+	}
+	for _, c := range r.main {
+		resetOnce(c)
+	}
+	for _, c := range r.fallback {
+		resetOnce(c)
+	}
+	for _, policy := range r.policy {
+		policy.forEachClient(resetOnce)
+	}
+	r.defaultResolver.resetConnections(seen)
 }
 
 type NameServer struct {
@@ -521,9 +546,10 @@ func (rs Resolvers) ClearCache() {
 }
 
 func (rs Resolvers) ResetConnection() {
-	rs.Resolver.ResetConnection()
-	rs.ProxyResolver.ResetConnection()
-	rs.DirectResolver.ResetConnection()
+	seen := make(map[dnsClient]struct{})
+	rs.Resolver.resetConnections(seen)
+	rs.ProxyResolver.resetConnections(seen)
+	rs.DirectResolver.resetConnections(seen)
 }
 
 func NewResolverFromClient(client dnsClient) *Resolver {

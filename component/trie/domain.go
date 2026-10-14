@@ -198,6 +198,31 @@ func (t *DomainTrie[T]) IsEmpty() bool {
 	return len(t.root.getChildren()) == 0
 }
 
+// ForeachValue visits stored values without reconstructing domain patterns.
+func (t *DomainTrie[T]) ForeachValue(fn func(T) bool) {
+	if t != nil {
+		foreachValue(t.root, fn)
+	}
+}
+
+func foreachValue[T any](node *Node[T], fn func(T) bool) bool {
+	if node == nil {
+		return true
+	}
+	if !node.isEmpty() && !fn(node.data) {
+		return false
+	}
+	if node.childNode != nil && !foreachValue(node.childNode, fn) {
+		return false
+	}
+	for _, child := range node.childMap {
+		if !foreachValue(child, fn) {
+			return false
+		}
+	}
+	return true
+}
+
 func recursion[T any](items []string, node *Node[T], fn func(domain string, data T) bool) bool {
 	for key, data := range node.getChildren() {
 		newItems := append([]string{key}, items...)

@@ -147,16 +147,20 @@ func transform(servers []NameServer, resolver resolver.Resolver) []dnsClient {
 // client, then re-wraps it according to params. Passing a raw client is fine (the
 // peel is a no-op), which lets a shared raw transport be re-wrapped per name server.
 func rewrapClient(c dnsClient, params map[string]string) dnsClient {
-	for {
-		u, ok := c.(interface{ Unwrap() dnsClient })
-		if !ok {
-			break
-		}
-		c = u.Unwrap()
-	}
+	c = rawTransport(c)
 	c = wrapClientWithEdns0Subnet(c, params)
 	c = wrapClientWithDisableTypes(c, params)
 	return c
+}
+
+func rawTransport(c dnsClient) dnsClient {
+	for {
+		u, ok := c.(interface{ Unwrap() dnsClient })
+		if !ok {
+			return c
+		}
+		c = u.Unwrap()
+	}
 }
 
 // isWrapperOnlyParam reports whether a param only affects the wrapper layer and not
