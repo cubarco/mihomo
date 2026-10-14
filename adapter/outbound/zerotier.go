@@ -17,7 +17,6 @@ import (
 
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/iface"
-	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/log"
@@ -93,7 +92,7 @@ type ZeroTier struct {
 	runtime              *zeroTierRuntime
 	config               ZT.NetworkConfigData
 	tunDevice            ipStack
-	resolver             resolver.Resolver
+	resolver             *nodeDNS
 	networkErr           error
 	stateCh              chan struct{}
 	latestConfig         ZT.NetworkConfigData
@@ -371,11 +370,12 @@ func zeroTierTransportInterfaces() ([]ZTTransport.Interface, error) {
 	return result, nil
 }
 
-func (z *ZeroTier) detachStackLocked() ipStack {
+func (z *ZeroTier) detachStackLocked() (ipStack, *nodeDNS) {
 	device := z.tunDevice
+	remoteResolver := z.resolver
 	z.tunDevice = nil
 	z.resolver = nil
-	return device
+	return device, remoteResolver
 }
 
 func (z *ZeroTier) resetNetworkStateLocked(networkErr error) {
@@ -408,9 +408,9 @@ func (z *ZeroTier) clearLoggedNetworkFailure(source *zeroTierRuntime) bool {
 	return true
 }
 
-func (z *ZeroTier) detachRuntimeLocked() (runtime *zeroTierRuntime, device ipStack) {
+func (z *ZeroTier) detachRuntimeLocked() (runtime *zeroTierRuntime, device ipStack, remoteResolver *nodeDNS) {
 	runtime = z.runtime
-	device = z.detachStackLocked()
+	device, remoteResolver = z.detachStackLocked()
 	z.runtime = nil
 	return
 }
@@ -791,7 +791,7 @@ func (z *ZeroTier) recoverIdentityCollision(source *zeroTierRuntime, address ZT.
 		z.stateMu.Unlock()
 		return
 	}
-	runtime, device := z.detachRuntimeLocked()
+	runtime, device, remoteResolver := z.detachRuntimeLocked()
 	var collisionErr error
 	if !z.configuredIdentity.Address().IsZero() {
 		collisionErr = fmt.Errorf("configured ZeroTier identity %s: %w", address, ZT.ErrIdentityCollision)
@@ -800,6 +800,7 @@ func (z *ZeroTier) recoverIdentityCollision(source *zeroTierRuntime, address ZT.
 	z.resetNetworkStateLocked(collisionErr)
 	z.stateMu.Unlock()
 
+	remoteResolver.close()
 	_ = runtime.close(device)
 	if collisionErr != nil {
 		log.Warnln("[ZeroTier](%s) %v; the next use can retry in %s", z.Name(), collisionErr, zeroTierIdentityCollisionRetryInterval)
@@ -898,7 +899,7 @@ func (z *ZeroTier) invalidateNetwork(source *zeroTierRuntime, err error, authURL
 		z.stateMu.Unlock()
 		return false
 	}
-	device := z.detachStackLocked()
+	device, remoteResolver := z.detachStackLocked()
 	if !retryConfig {
 		z.latestConfig = ZT.NetworkConfigData{}
 		z.haveLatestConfig = false
@@ -914,6 +915,7 @@ func (z *ZeroTier) invalidateNetwork(source *zeroTierRuntime, err error, authURL
 	z.configGeneration++
 	z.setNetworkFailureLocked(err, authURL, retryConfig)
 	z.stateMu.Unlock()
+	remoteResolver.close()
 	if device != nil {
 		go func() { _ = device.Close() }()
 	}
@@ -926,9 +928,10 @@ func (z *ZeroTier) invalidateDevice(device ipStack, err error) bool {
 		z.stateMu.Unlock()
 		return false
 	}
-	z.detachStackLocked()
+	_, remoteResolver := z.detachStackLocked()
 	z.setNetworkFailureLocked(err, z.authURL, true)
 	z.stateMu.Unlock()
+	remoteResolver.close()
 	go func() { _ = device.Close() }()
 	return true
 }
@@ -959,6 +962,7 @@ func (z *ZeroTier) applyNetworkConfig(config ZT.NetworkConfigData, generation ui
 	if err != nil {
 		return err
 	}
+	defer func() { remoteResolver.close() }()
 	mtu := z.effectiveMTU(config)
 	replaceDevice := oldDevice == nil || !oldConfig.ManagedAddressesEqual(config) || z.effectiveMTU(oldConfig) != mtu
 	device := oldDevice
@@ -1011,15 +1015,18 @@ func (z *ZeroTier) applyNetworkConfig(config ZT.NetworkConfigData, generation ui
 		return errZeroTierStaleConfig
 	}
 	replacedDevice := z.tunDevice
+	replacedResolver := z.resolver
 	z.config = config
 	z.tunDevice = device
 	z.resolver = remoteResolver
+	remoteResolver = nil
 	z.networkErr = nil
 	z.authURL = ""
 	z.retryLatestConfig = false
 	z.configGeneration++
 	z.notifyStateLocked()
 	z.stateMu.Unlock()
+	replacedResolver.close()
 	if !replaceDevice {
 		return nil
 	}
@@ -1057,7 +1064,7 @@ func (z *ZeroTier) effectiveMTU(config ZT.NetworkConfigData) uint32 {
 	return mtu
 }
 
-func (z *ZeroTier) resolverForNetworkConfig(config ZT.NetworkConfigData) (resolver.Resolver, error) {
+func (z *ZeroTier) resolverForNetworkConfig(config ZT.NetworkConfigData) (*nodeDNS, error) {
 	if !z.option.RemoteDnsResolve {
 		return nil, nil
 	}
@@ -1084,7 +1091,7 @@ func (z *ZeroTier) resolverForNetworkConfig(config ZT.NetworkConfigData) (resolv
 	for i := range nameServers {
 		nameServers[i].ProxyAdapter = z
 	}
-	return resolver.Resolver(dns.NewResolver(dns.Config{Main: nameServers, IPv6: config.HasManagedIPv6()})), nil
+	return &nodeDNS{servers: nameServers, ipv6: config.HasManagedIPv6()}, nil
 }
 
 func (z *ZeroTier) runStackPackets(runtime *zeroTierRuntime, device ipStack) {
@@ -1261,9 +1268,9 @@ func (z *ZeroTier) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.C
 	z.stateMu.RUnlock()
 	var conn net.Conn
 	if !metadata.Resolved() || remoteResolver != nil {
-		r := resolver.DefaultResolver
-		if remoteResolver != nil {
-			r = remoteResolver
+		r, resolveErr := remoteResolver.get(ctx)
+		if resolveErr != nil {
+			return nil, resolveErr
 		}
 		options := z.DialOptions()
 		options = append(options, dialer.WithResolver(r))
@@ -1313,13 +1320,16 @@ func (z *ZeroTier) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 }
 
 func (z *ZeroTier) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
+	if err := z.ctx.Err(); err != nil {
+		return err
+	}
 	z.stateMu.RLock()
 	remoteResolver := z.resolver
 	z.stateMu.RUnlock()
 	if (!metadata.Resolved() || remoteResolver != nil) && metadata.Host != "" {
-		r := resolver.DefaultResolver
-		if remoteResolver != nil {
-			r = remoteResolver
+		r, err := remoteResolver.get(ctx)
+		if err != nil {
+			return err
 		}
 		ip, err := resolveIPWithResolver(ctx, metadata.Host, z.prefer, r)
 		if err != nil {
@@ -1341,12 +1351,14 @@ func (z *ZeroTier) IsL3Protocol(*C.Metadata) bool {
 }
 
 func (z *ZeroTier) Close() error {
-	// Cancel and close the physical transport before waiting for operationMu so
+	// Cancel DNS work and close the physical transport before waiting for operationMu so
 	// an in-flight startup dial or wire write cannot prevent its own shutdown.
 	z.cancel()
 	z.stateMu.RLock()
 	runtime := z.runtime
+	remoteResolver := z.resolver
 	z.stateMu.RUnlock()
+	remoteResolver.close()
 	if runtime != nil {
 		_ = runtime.wire.Close()
 	}
@@ -1357,9 +1369,10 @@ func (z *ZeroTier) Close() error {
 	}
 	z.closed = true
 	z.stateMu.Lock()
-	runtime, device := z.detachRuntimeLocked()
+	runtime, device, remoteResolver := z.detachRuntimeLocked()
 	z.resetNetworkStateLocked(errZeroTierClosed)
 	z.stateMu.Unlock()
+	remoteResolver.close()
 	z.operationMu.Unlock()
 	if runtime != nil {
 		return runtime.close(device)

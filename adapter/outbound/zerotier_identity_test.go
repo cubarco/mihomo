@@ -77,6 +77,8 @@ func TestZeroTierConfiguredIdentity(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			runtime := &zeroTierRuntime{node: node, nodeAddress: identity.Address(), wire: wire, ctx: ctx, cancel: cancel}
 			outbound.stateStore, outbound.runtime = store, runtime
+			owner, _, assertRetired := blockedSessionDNS(t)
+			outbound.resolver = owner
 			before, err := store.Get("identity.secret")
 			if err != nil {
 				t.Fatal(err)
@@ -85,7 +87,11 @@ func TestZeroTierConfiguredIdentity(t *testing.T) {
 			if outbound.runtime != runtime {
 				t.Fatal("stale callback retired the current runtime")
 			}
+			if owner.closed {
+				t.Fatal("stale callback retired the current DNS resolver")
+			}
 			outbound.recoverIdentityCollision(runtime, identity.Address())
+			assertRetired()
 			if outbound.runtime != nil || !errors.Is(outbound.networkErr, ZT.ErrIdentityCollision) || ctx.Err() == nil {
 				t.Fatal("collision did not retire the runtime and report an error")
 			}
