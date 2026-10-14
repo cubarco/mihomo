@@ -247,18 +247,29 @@ func updateNTP(c *config.NTP) {
 	}
 }
 
+var dnsRetireAfter = time.AfterFunc
+
+func installedResolvers() []resolver.Resolver {
+	return []resolver.Resolver{resolver.DefaultResolver, resolver.ProxyServerHostResolver, resolver.DirectHostResolver}
+}
+
+func stopDNS() {
+	retired := installedResolvers()
+	resolver.DefaultResolver = nil
+	resolver.DefaultService = nil
+	resolver.ProxyServerHostResolver = nil
+	resolver.DirectHostResolver = nil
+	resolver.CloseQueries(retired...)
+	dns.ReCreateServer("", nil, nil)
+}
+
 func updateDNS(c *config.DNS, generalIPv6 bool) {
-	retired := []resolver.Resolver{resolver.DefaultResolver, resolver.ProxyServerHostResolver, resolver.DirectHostResolver}
 	if !c.Enable {
-		resolver.DefaultResolver = nil
 		resolver.DefaultHostMapper = nil
-		resolver.DefaultService = nil
-		resolver.ProxyServerHostResolver = nil
-		resolver.DirectHostResolver = nil
-		resolver.CloseQueries(retired...)
-		dns.ReCreateServer("", nil, nil)
+		stopDNS()
 		return
 	}
+	retired := installedResolvers()
 
 	ipv6 := c.IPv6 && generalIPv6
 	r := dns.NewResolver(dns.Config{
@@ -314,7 +325,8 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 
 	lc := inbound.NewListenConfig()
 	lc.SetRouteMark(c.ListenRoutingMark)
-	resolver.CloseQueries(retired...)
+	// Rule matching and proxy dials may still be waiting on the replaced resolvers.
+	dnsRetireAfter(resolver.DefaultDNSTimeout, func() { resolver.CloseQueries(retired...) })
 	dns.ReCreateServer(c.Listen, lc, s)
 }
 
@@ -561,7 +573,8 @@ func Shutdown() {
 	listener.Cleanup()
 	tproxy.CleanupTProxyIPTables()
 	resolver.StoreFakePoolState()
-	updateDNS(&config.DNS{}, false)
+	// Android lib mode re-initialises in-process; the next updateDNS patches fake-IP state from this mapper.
+	stopDNS()
 
 	log.Warnln("Mihomo shutting down")
 }
