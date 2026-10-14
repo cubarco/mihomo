@@ -126,8 +126,9 @@ func (m *Manager) ResetStatistic() {
 	m.rates = [4]int64{}
 }
 
-// Consumers share a one-second sample; a dormant reader restarts its baseline
-// so traffic accumulated with a hidden window cannot become a rate spike.
+// Readers within half a second share a sample, so each jittery 1 Hz poll gets a
+// fresh rate; a dormant reader restarts its baseline so traffic accumulated
+// with a hidden window cannot become a rate spike.
 func (m *Manager) sampleRates(now time.Time) [4]int64 {
 	m.rateMu.Lock()
 	defer m.rateMu.Unlock()
@@ -139,7 +140,7 @@ func (m *Manager) sampleRates(now time.Time) [4]int64 {
 		m.rates = [4]int64{}
 		m.rateTotals = totals
 		m.rateAt = now
-	} else if elapsed := now.Sub(m.rateAt); elapsed >= time.Second {
+	} else if elapsed := now.Sub(m.rateAt); elapsed >= 500*time.Millisecond {
 		for i, total := range totals {
 			m.rates[i] = int64(float64(max(0, total-m.rateTotals[i])) / elapsed.Seconds())
 		}

@@ -53,6 +53,25 @@ func TestDemandRatesShareSamplesAndDiscardDormantTraffic(t *testing.T) {
 	})
 }
 
+func TestJitteredOneSecondPollsEachReadAFreshRate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		m := &Manager{}
+		m.Now()
+		for _, gap := range []time.Duration{995 * time.Millisecond, 1005 * time.Millisecond, 990 * time.Millisecond, 995 * time.Millisecond} {
+			m.PushDownloaded(false, 5*gap.Milliseconds())
+			time.Sleep(gap)
+			if _, down := m.Now(); down != 5000 {
+				t.Fatalf("poll after %v read %d B/s, want 5000", gap, down)
+			}
+		}
+		m.PushDownloaded(false, 5000)
+		time.Sleep(400 * time.Millisecond)
+		if _, down := m.NowTraffic(true); down != 5000 {
+			t.Fatalf("reader within half a second did not share the last sample: %d", down)
+		}
+	})
+}
+
 func TestConcurrentRateReadersPreserveTrafficTotals(t *testing.T) {
 	m := &Manager{}
 	var workers sync.WaitGroup
