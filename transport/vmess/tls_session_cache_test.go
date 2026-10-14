@@ -16,11 +16,16 @@ import (
 	"github.com/metacubex/tls"
 )
 
+var testRemote = &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 443}
+
 func TestTLSSessionSecurityBoundaries(t *testing.T) {
 	var caches tlsSessionCaches
 	base := TLSConfig{Host: "proxy.test", NextProtos: []string{"h2", "http/1.1"}}
 	config := &tls.Config{RootCAs: x509.NewCertPool()}
-	first := caches.forConfig(&base, config)
+	first := caches.forConfig(&base, config, testRemote)
+	if caches.forConfig(&base, config, &net.TCPAddr{IP: net.IPv4(192, 0, 2, 2), Port: 443}) == first {
+		t.Fatal("different endpoints share tickets")
+	}
 	for name, change := range map[string]func(*TLSConfig){
 		"server":          func(c *TLSConfig) { c.Host = "other.test" },
 		"verification":    func(c *TLSConfig) { c.SkipCertVerify = true },
@@ -32,7 +37,7 @@ func TestTLSSessionSecurityBoundaries(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			changed := base
 			change(&changed)
-			if got := caches.forConfig(&changed, config); got == nil || got == first {
+			if got := caches.forConfig(&changed, config, testRemote); got == nil || got == first {
 				t.Fatal("different TLS identities share tickets")
 			}
 		})
@@ -41,17 +46,17 @@ func TestTLSSessionSecurityBoundaries(t *testing.T) {
 	for range 32 {
 		wg.Go(func() {
 			copy := base
-			if caches.forConfig(&copy, config) != first {
+			if caches.forConfig(&copy, config, testRemote) != first {
 				t.Error("concurrent flow lost its shared session cache")
 			}
 		})
 	}
 	wg.Wait()
 	newTrust := &tls.Config{RootCAs: x509.NewCertPool()}
-	if caches.forConfig(&base, newTrust) == first {
+	if caches.forConfig(&base, newTrust, testRemote) == first {
 		t.Fatal("trust pool replacement retained previous tickets")
 	}
-	if caches.forConfig(&base, config) == first {
+	if caches.forConfig(&base, config, testRemote) == first {
 		t.Fatal("old trust pool retained in the shared cache")
 	}
 	for name, change := range map[string]func(*TLSConfig){
@@ -63,12 +68,12 @@ func TestTLSSessionSecurityBoundaries(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			changed := base
 			change(&changed)
-			if caches.forConfig(&changed, config) != nil {
+			if caches.forConfig(&changed, config, testRemote) != nil {
 				t.Fatal("dynamic identity received an implicit session cache")
 			}
 			explicit := config.Clone()
 			explicit.ClientSessionCache = tls.NewLRUClientSessionCache(1)
-			if caches.forConfig(&changed, explicit) != explicit.ClientSessionCache {
+			if caches.forConfig(&changed, explicit, testRemote) != explicit.ClientSessionCache {
 				t.Fatal("replaced the caller's explicit cache")
 			}
 		})
@@ -83,11 +88,11 @@ func TestTLSSessionCacheBudget(t *testing.T) {
 	var caches tlsSessionCaches
 	config := &tls.Config{}
 	base := &TLSConfig{Host: "oldest.test"}
-	oldest := caches.forConfig(base, config)
+	oldest := caches.forConfig(base, config, testRemote)
 	for i := range tlsSessionCacheBuckets {
-		caches.forConfig(&TLSConfig{Host: fmt.Sprintf("proxy-%d.test", i)}, config)
+		caches.forConfig(&TLSConfig{Host: fmt.Sprintf("proxy-%d.test", i)}, config, testRemote)
 	}
-	if caches.forConfig(base, config) == oldest {
+	if caches.forConfig(base, config, testRemote) == oldest {
 		t.Fatal("cache exceeded its identity budget")
 	}
 	oldest.Put("first", new(tls.ClientSessionState))
@@ -110,13 +115,18 @@ func testSessionServer(t testing.TB, version uint16) (*tls.Config, string) {
 	return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: version, MaxVersion: version}, pin
 }
 
-func testSessionHandshake(t testing.TB, server *tls.Config, cfg *TLSConfig) (bool, error) {
+func testSessionListener(t testing.TB) net.Listener {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	t.Cleanup(func() { _ = listener.Close() })
+	return listener
+}
+
+func testSessionHandshake(t testing.TB, listener net.Listener, server *tls.Config, cfg *TLSConfig) (bool, error) {
+	t.Helper()
 	done := make(chan error, 1)
 	go func() {
 		serverSide, err := listener.Accept()
@@ -159,24 +169,29 @@ func TestStreamTLSResumesAcrossFlows(t *testing.T) {
 	for _, version := range []uint16{tls.VersionTLS12, tls.VersionTLS13} {
 		t.Run(tls.VersionName(version), func(t *testing.T) {
 			server, pin := testSessionServer(t, version)
+			listener := testSessionListener(t)
 			for attempt := range 3 {
-				resumed, err := testSessionHandshake(t, server, &TLSConfig{Host: t.Name(), FingerPrint: pin})
+				resumed, err := testSessionHandshake(t, listener, server, &TLSConfig{Host: t.Name(), FingerPrint: pin})
 				if err != nil || resumed != (attempt > 0) {
 					t.Fatalf("flow %d: resumed=%v, err=%v", attempt, resumed, err)
 				}
 			}
-			if _, err := testSessionHandshake(t, server, &TLSConfig{Host: t.Name(), FingerPrint: strings.Repeat("00", 32)}); err == nil {
+			resumed, err := testSessionHandshake(t, testSessionListener(t), server, &TLSConfig{Host: t.Name(), FingerPrint: pin})
+			if err != nil || resumed {
+				t.Fatalf("another endpoint with the same name: resumed=%v, err=%v", resumed, err)
+			}
+			if _, err := testSessionHandshake(t, listener, server, &TLSConfig{Host: t.Name(), FingerPrint: strings.Repeat("00", 32)}); err == nil {
 				t.Fatal("a cached session bypassed a changed certificate pin")
 			}
 			ca.ResetCertificate()
-			resumed, err := testSessionHandshake(t, server, &TLSConfig{Host: t.Name(), FingerPrint: pin})
+			resumed, err = testSessionHandshake(t, listener, server, &TLSConfig{Host: t.Name(), FingerPrint: pin})
 			if err != nil || resumed {
 				t.Fatalf("trust reset: resumed=%v, err=%v", resumed, err)
 			}
 			withoutTickets := server.Clone()
 			withoutTickets.SessionTicketsDisabled = true
 			for range 2 {
-				resumed, err := testSessionHandshake(t, withoutTickets, &TLSConfig{Host: t.Name(), FingerPrint: pin})
+				resumed, err := testSessionHandshake(t, listener, withoutTickets, &TLSConfig{Host: t.Name(), FingerPrint: pin})
 				if err != nil || resumed {
 					t.Fatalf("server without tickets: resumed=%v, err=%v", resumed, err)
 				}

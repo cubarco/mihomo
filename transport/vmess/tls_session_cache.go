@@ -2,6 +2,7 @@ package vmess
 
 import (
 	"crypto/x509"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,8 +14,8 @@ import (
 const tlsSessionCacheBuckets = 128
 
 type tlsSessionIdentity struct {
-	host, name, fingerprint, alpn string
-	skipVerify                    bool
+	remote, host, name, fingerprint, alpn string
+	skipVerify                            bool
 }
 
 type tlsSessionCaches struct {
@@ -25,7 +26,9 @@ type tlsSessionCaches struct {
 
 var sharedTLSSessions tlsSessionCaches
 
-func (c *tlsSessionCaches) forConfig(cfg *TLSConfig, config *tls.Config) tls.ClientSessionCache {
+// Tickets stay with one endpoint: servers sharing an SNI would reject each other's tickets, and presenting the same
+// ticket to several node addresses links them to one client.
+func (c *tlsSessionCaches) forConfig(cfg *TLSConfig, config *tls.Config, remote net.Addr) tls.ClientSessionCache {
 	if config.ClientSessionCache != nil {
 		return config.ClientSessionCache
 	}
@@ -42,6 +45,9 @@ func (c *tlsSessionCaches) forConfig(cfg *TLSConfig, config *tls.Config) tls.Cli
 	key := tlsSessionIdentity{
 		host: cfg.Host, name: cfg.NameCertVerify, fingerprint: cfg.FingerPrint,
 		skipVerify: cfg.SkipCertVerify, alpn: alpn.String(),
+	}
+	if remote != nil {
+		key.remote = remote.String()
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
