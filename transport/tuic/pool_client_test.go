@@ -124,7 +124,7 @@ func TestPoolCloseCancelsDialAndDiscardsLateConnections(t *testing.T) {
 				t.Run(fmt.Sprintf("v%d/udp-%t/late-%t", version, udp, late), func(t *testing.T) {
 					var connection *quic.Conn
 					if late {
-						connection = testutil.StreamLimitedConn(t)
+						connection = testutil.ConnectedQUIC(t, -1)
 					}
 					started := make(chan struct{})
 					pool := testPoolClient(version, NATIVE, func(ctx context.Context) (*quic.Conn, error) {
@@ -161,4 +161,18 @@ func TestPoolCloseCancelsDialAndDiscardsLateConnections(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestPoolDialKeepsConnectionAfterCallerCancel(t *testing.T) {
+	connection := testutil.ConnectedQUIC(t, -1)
+	ctx, cancel := context.WithCancel(context.Background())
+	pool := testPoolClient(5, NATIVE, func(context.Context) (*quic.Conn, error) {
+		cancel()
+		return connection, nil
+	})
+	t.Cleanup(pool.Close)
+	conn, err := pool.dialFn(ctx)
+	require.NoError(t, err)
+	require.Same(t, connection, conn)
+	require.NoError(t, connection.Context().Err())
 }

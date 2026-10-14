@@ -36,10 +36,6 @@ func TLSConfigs(t testing.TB) (server, client *tls.Config) {
 	return
 }
 
-func StreamLimitedConn(t testing.TB) *quic.Conn {
-	return ConnectedQUIC(t, -1)
-}
-
 func ConnectedQUIC(t testing.TB, maxStreams int64) *quic.Conn {
 	t.Helper()
 	serverTLS, clientTLS := TLSConfigs(t)

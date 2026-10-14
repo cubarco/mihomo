@@ -300,7 +300,7 @@ func (t *clientImpl) DialContext(ctx context.Context, metadata *C.Metadata) (net
 			quicConn.LocalAddr(),
 			quicConn.RemoteAddr(),
 			func() {
-				common.AfterGrace(C.DefaultTCPTimeout, t, session, (*clientImpl).releaseStream)
+				common.AfterGrace(common.StreamGrace, t, session, (*clientImpl).releaseStream)
 			},
 		)
 		_, err = buf.WriteTo(stream)
@@ -375,7 +375,7 @@ func (t *clientImpl) ListenPacket(ctx context.Context, metadata *C.Metadata) (ne
 		deferQuicConnFn:       func(_ *quic.Conn, err error) { t.deferSession(session, err) },
 		closeDeferFn: func() {
 			session.udpInputMap.Delete(connId)
-			common.AfterGrace(C.DefaultUDPTimeout, t, session, (*clientImpl).releaseStream)
+			common.AfterGrace(common.StreamGrace, t, session, (*clientImpl).releaseStream)
 		},
 	}
 	return pc, nil

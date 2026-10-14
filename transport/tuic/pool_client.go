@@ -144,11 +144,7 @@ func (t *PoolClient) Close() {
 			clients, clientsMutex := t.clients(udp)
 			clientsMutex.Lock()
 			for it := clients.Front(); it != nil; it = it.Next() {
-				if client, ok := it.Value.(interface{ ForceClose() }); ok {
-					client.ForceClose()
-				} else if it.Value != nil {
-					it.Value.Close()
-				}
+				it.Value.ForceClose()
 			}
 			clients.Init()
 			clientsMutex.Unlock()
@@ -171,7 +167,7 @@ func newPoolClient(dialFn DialFunc) *PoolClient {
 			if err != nil {
 				return nil, err
 			}
-			if err = ctx.Err(); err != nil {
+			if err = poolCtx.Err(); err != nil {
 				_ = conn.CloseWithError(0, err.Error())
 				return nil, err
 			}

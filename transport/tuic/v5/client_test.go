@@ -5,11 +5,10 @@ import (
 	"errors"
 	"net"
 	"net/netip"
-	"runtime"
 	"testing"
-	"time"
 
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/transport/tuic/common"
 	"github.com/metacubex/mihomo/transport/tuic/internal/testutil"
 	"github.com/metacubex/mihomo/transport/tuic/types"
 	"github.com/metacubex/quic-go"
@@ -21,15 +20,15 @@ func retirementClient(dial types.DialFunc) (types.Client, func()) {
 }
 
 func TestClientRetiredStreams(t *testing.T) {
-	testutil.CheckClientRetirement(t, retirementClient)
+	testutil.CheckClientRetirement(t, &common.StreamGrace, retirementClient)
 }
 
 func TestClientGraceClose(t *testing.T) {
-	testutil.CheckClientGraceClose(t, retirementClient)
+	testutil.CheckClientGraceClose(t, &common.StreamGrace, retirementClient)
 }
 
 func TestDialContextReleasesRejectedStreamSlot(t *testing.T) {
-	quicConn := testutil.StreamLimitedConn(t)
+	quicConn := testutil.ConnectedQUIC(t, -1)
 	client := &clientImpl{ClientOption: &ClientOption{MaxOpenStreams: 3}}
 	client.session.Store(&clientSession{conn: quicConn})
 	metadata := &C.Metadata{DstIP: netip.MustParseAddr("192.0.2.1"), DstPort: 443}
@@ -46,7 +45,7 @@ func TestDialContextReleasesRejectedStreamSlot(t *testing.T) {
 }
 
 func TestDialContextReleasesClosedConnectionSlot(t *testing.T) {
-	quicConn := testutil.StreamLimitedConn(t)
+	quicConn := testutil.ConnectedQUIC(t, -1)
 	if err := quicConn.CloseWithError(0, "closed before dial"); err != nil {
 		t.Fatal(err)
 	}
@@ -63,38 +62,8 @@ func TestDialContextReleasesClosedConnectionSlot(t *testing.T) {
 }
 
 func TestGraceDoesNotRetainRetiredClient(t *testing.T) {
-	transport := testutil.ConnectedQUIC(t, 10)
-	collected := make(chan struct{}, 2)
-	func() {
-		client := &clientImpl{
-			ClientOption: &ClientOption{MaxOpenStreams: 10, UdpRelayMode: types.NATIVE},
-			udp:          true,
-			dialFn:       func(context.Context) (*quic.Conn, error) { return transport, nil },
-		}
-		markCollected := func(done chan struct{}) { done <- struct{}{} }
-		runtime.AddCleanup(client, markCollected, collected)
-		stream, err := client.ListenPacket(context.Background(), &C.Metadata{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		runtime.AddCleanup(client.session.Load(), markCollected, collected)
-		if err := stream.Close(); err != nil {
-			t.Fatal(err)
-		}
-		client.forceClose(nil, net.ErrClosed)
-	}()
-	deadline := time.Now().Add(C.DefaultUDPTimeout / 2)
-	for pending := 2; pending > 0; {
-		runtime.GC()
-		select {
-		case <-collected:
-			pending--
-			continue
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the grace timer retained a retired client or session")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	testutil.CheckGraceReleasesRetiredClient(t, common.StreamGrace, func(dial types.DialFunc) (*clientImpl, func() *clientSession, func()) {
+		client := &clientImpl{ClientOption: &ClientOption{MaxOpenStreams: 10, UdpRelayMode: types.NATIVE}, udp: true, dialFn: dial}
+		return client, client.session.Load, func() { client.forceClose(nil, net.ErrClosed) }
+	})
 }
