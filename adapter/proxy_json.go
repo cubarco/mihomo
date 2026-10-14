@@ -39,27 +39,8 @@ func WriteProxyJSON(w io.Writer, proxy C.Proxy) error {
 	return err
 }
 
-func (p *Proxy) appendMergedJSON(b, inner []byte) (out []byte, ok bool) {
-	members, ok := canonicalMembers(inner)
-	if !ok {
-		return b, false
-	}
+func (p *Proxy) appendMergedJSON(b, inner []byte) ([]byte, bool) {
 	info := p.ProxyInfo()
-	fields := []jsonMember{
-		{key: "alive", value: strconv.AppendBool(nil, p.alive.Load())},
-		{key: "dialer-proxy", value: appendJSONString(nil, info.DialerProxy)},
-		{key: "interface", value: appendJSONString(nil, info.Interface)},
-		{key: "mptcp", value: strconv.AppendBool(nil, info.MPTCP)},
-		{key: "name", value: appendJSONString(nil, p.Name())},
-		{key: "provider-name", value: appendJSONString(nil, info.ProviderName)},
-		{key: "routing-mark", value: strconv.AppendInt(nil, int64(info.RoutingMark), 10)},
-		{key: "smux", value: strconv.AppendBool(nil, info.SMUX)},
-		{key: "tfo", value: strconv.AppendBool(nil, info.TFO)},
-		{key: "udp", value: strconv.AppendBool(nil, p.SupportUDP())},
-		{key: "uot", value: strconv.AppendBool(nil, p.SupportUOT())},
-		{key: "xudp", value: strconv.AppendBool(nil, info.XUDP)},
-	}
-	var err error
 	extra, err := p.appendExtraJSON(nil)
 	if err != nil {
 		return b, false
@@ -68,27 +49,41 @@ func (p *Proxy) appendMergedJSON(b, inner []byte) (out []byte, ok bool) {
 	if err != nil {
 		return b, false
 	}
-	fields = append(fields, jsonMember{key: "extra", value: extra}, jsonMember{key: "history", value: history})
-	for _, member := range members {
-		replaced := false
-		for _, field := range fields {
-			if field.key == member.key {
-				replaced = true
-				break
-			}
-		}
-		if !replaced {
-			fields = append(fields, member)
+	fields := append(make([]jsonMember, 0, 24), []jsonMember{
+		{key: "alive", value: jsonBool(p.alive.Load())},
+		{key: "dialer-proxy", value: appendJSONString(nil, info.DialerProxy)},
+		{key: "extra", value: extra},
+		{key: "history", value: history},
+		{key: "interface", value: appendJSONString(nil, info.Interface)},
+		{key: "mptcp", value: jsonBool(info.MPTCP)},
+		{key: "name", value: appendJSONString(nil, p.Name())},
+		{key: "provider-name", value: appendJSONString(nil, info.ProviderName)},
+		{key: "routing-mark", value: strconv.AppendInt(nil, int64(info.RoutingMark), 10)},
+		{key: "smux", value: jsonBool(info.SMUX)},
+		{key: "tfo", value: jsonBool(info.TFO)},
+		{key: "udp", value: jsonBool(p.SupportUDP())},
+		{key: "uot", value: jsonBool(p.SupportUOT())},
+		{key: "xudp", value: jsonBool(info.XUDP)},
+	}...)
+	wrapper := len(fields)
+	fields, ok := appendCanonicalMembers(fields, inner)
+	if !ok {
+		return b, false
+	}
+	merged := fields[:wrapper]
+	for _, member := range fields[wrapper:] {
+		if !slices.ContainsFunc(fields[:wrapper], func(field jsonMember) bool { return field.key == member.key }) {
+			merged = append(merged, member)
 		}
 	}
-	sortMembers(fields)
+	sortMembers(merged)
 	size := 2
-	for _, field := range fields {
+	for _, field := range merged {
 		size += len(field.key) + len(field.value) + 4
 	}
 	b = slices.Grow(b, size)
 	b = append(b, '{')
-	for i, field := range fields {
+	for i, field := range merged {
 		if i > 0 {
 			b = append(b, ',')
 		}
@@ -97,6 +92,15 @@ func (p *Proxy) appendMergedJSON(b, inner []byte) (out []byte, ok bool) {
 		b = append(b, field.value...)
 	}
 	return append(b, '}'), true
+}
+
+var jsonTrue, jsonFalse = []byte("true"), []byte("false")
+
+func jsonBool(v bool) []byte {
+	if v {
+		return jsonTrue
+	}
+	return jsonFalse
 }
 
 type jsonMember struct {
@@ -108,14 +112,13 @@ func sortMembers(members []jsonMember) {
 	slices.SortFunc(members, func(a, b jsonMember) int { return cmp.Compare(a.key, b.key) })
 }
 
-func canonicalMembers(data []byte) ([]jsonMember, bool) {
+func appendCanonicalMembers(members []jsonMember, data []byte) ([]jsonMember, bool) {
 	s := jsonScan{data: data}
-	var members []jsonMember
 	if !s.object(func(key string, value []byte) bool {
 		members = append(members, jsonMember{key: key, value: value})
 		return true
 	}) || s.i != len(data) {
-		return nil, false
+		return members, false
 	}
 	return members, true
 }
@@ -262,7 +265,7 @@ func (s *jsonScan) scanString(decode bool) (string, bool) {
 			s.i++
 			continue
 		}
-		if !jsonPlainBytes(s.data[segment:s.i]) {
+		if !jsonPlain(s.data[segment:s.i]) {
 			return "", false
 		}
 		if s.i+1 >= len(s.data) {
@@ -287,7 +290,7 @@ func (s *jsonScan) scanString(decode bool) (string, bool) {
 		}
 		segment = s.i
 	}
-	if !jsonPlainBytes(s.data[segment:s.i]) {
+	if !jsonPlain(s.data[segment:s.i]) {
 		return "", false
 	}
 	s.i++
@@ -306,10 +309,6 @@ func (s *jsonScan) scanString(decode bool) (string, bool) {
 		return "", false
 	}
 	return value, true
-}
-
-func jsonPlainBytes(b []byte) bool {
-	return jsonPlain(string(b))
 }
 
 func appendDelayHistory(b []byte, records []C.DelayHistory, nilWhenEmpty bool) ([]byte, error) {
@@ -339,16 +338,17 @@ func appendDelayHistory(b []byte, records []C.DelayHistory, nilWhenEmpty bool) (
 }
 
 func appendJSONString(b []byte, s string) []byte {
-	if !jsonPlain(s) {
-		encoded, _ := json.Marshal(s)
-		return append(b, encoded...)
-	}
+	start := len(b)
 	b = append(b, '"')
 	b = append(b, s...)
-	return append(b, '"')
+	if jsonPlain(b[start+1:]) {
+		return append(b, '"')
+	}
+	encoded, _ := json.Marshal(s)
+	return append(b[:start], encoded...)
 }
 
-func jsonPlain(s string) bool {
+func jsonPlain(s []byte) bool {
 	for i := 0; i < len(s); {
 		c := s[i]
 		if c < utf8.RuneSelf {
@@ -358,8 +358,8 @@ func jsonPlain(s string) bool {
 			i++
 			continue
 		}
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if r == utf8.RuneError && size == 1 || r == ' ' || r == ' ' {
+		r, size := utf8.DecodeRune(s[i:])
+		if r == utf8.RuneError && size == 1 || r == '\u2028' || r == '\u2029' {
 			return false
 		}
 		i += size

@@ -208,7 +208,7 @@ func FuzzProxyJSONCanonicalMembers(f *testing.F) {
 		f.Add([]byte(seed))
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
-		if _, ok := canonicalMembers(data); !ok {
+		if _, ok := appendCanonicalMembers(nil, data); !ok {
 			return
 		}
 		var value any
