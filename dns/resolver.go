@@ -421,12 +421,7 @@ func (r *Resolver) resetConnections(seen map[dnsClient]struct{}) {
 		if raw == nil {
 			return
 		}
-		typ := reflect.TypeOf(raw)
-		comparable := typ.Comparable()
-		if comparable && (typ.Kind() == reflect.Struct || typ.Kind() == reflect.Array) {
-			comparable = reflect.ValueOf(raw).Comparable()
-		}
-		if comparable {
+		if reflect.ValueOf(raw).Comparable() {
 			if _, done := seen[raw]; done {
 				return
 			}
