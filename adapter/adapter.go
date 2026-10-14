@@ -127,18 +127,23 @@ func (p *Proxy) LastDelayForTestUrl(url string) (delay uint16) {
 
 // MarshalJSON implements C.ProxyAdapter
 func (p *Proxy) MarshalJSON() ([]byte, error) {
-	return p.appendJSON(nil)
+	return p.encodeJSON(nil)
 }
 
-func (p *Proxy) appendJSON(dst []byte) ([]byte, error) {
+// encodeJSON may build the result in the spare capacity of scratch.
+func (p *Proxy) encodeJSON(scratch []byte) ([]byte, error) {
 	inner, err := p.ProxyAdapter.MarshalJSON()
 	if err != nil {
 		return inner, err
 	}
-	if merged, ok := p.appendMergedJSON(dst, inner); ok {
+	if merged, ok := p.appendMergedJSON(scratch[:0], inner); ok {
 		return merged, nil
 	}
+	return p.legacyJSON(inner)
+}
 
+// legacyJSON is the reference shape: tests require appendMergedJSON to emit every field set here.
+func (p *Proxy) legacyJSON(inner []byte) ([]byte, error) {
 	mapping := map[string]any{}
 	_ = json.Unmarshal(inner, &mapping)
 	mapping["history"] = p.DelayHistory()
@@ -158,11 +163,7 @@ func (p *Proxy) appendJSON(dst []byte) ([]byte, error) {
 	mapping["provider-name"] = proxyInfo.ProviderName
 	mapping["dialer-proxy"] = proxyInfo.DialerProxy
 
-	data, err := json.Marshal(mapping)
-	if dst == nil || err != nil {
-		return data, err
-	}
-	return append(dst, data...), nil
+	return json.Marshal(mapping)
 }
 
 func (p *Proxy) urlTestOnce(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (t uint16, err error) {

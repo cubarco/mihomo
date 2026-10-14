@@ -21,8 +21,7 @@ func WriteProxyJSON(w io.Writer, proxy C.Proxy) error {
 		if buffered, ok := w.(interface{ AvailableBuffer() []byte }); ok {
 			data = buffered.AvailableBuffer()
 		}
-		data, err = p.appendJSON(data)
-		if err != nil {
+		if data, err = p.encodeJSON(data); err != nil {
 			err = &json.MarshalerError{Type: reflect.TypeFor[C.Proxy](), Err: err}
 		}
 	} else {

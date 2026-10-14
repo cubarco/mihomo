@@ -22,27 +22,7 @@ func legacyProxyJSON(p *Proxy) ([]byte, error) {
 	if err != nil {
 		return inner, err
 	}
-
-	mapping := map[string]any{}
-	_ = json.Unmarshal(inner, &mapping)
-	mapping["history"] = p.DelayHistory()
-	mapping["extra"] = p.ExtraDelayHistories()
-	mapping["alive"] = p.alive.Load()
-	mapping["name"] = p.Name()
-	mapping["udp"] = p.SupportUDP()
-	mapping["uot"] = p.SupportUOT()
-
-	proxyInfo := p.ProxyInfo()
-	mapping["xudp"] = proxyInfo.XUDP
-	mapping["tfo"] = proxyInfo.TFO
-	mapping["mptcp"] = proxyInfo.MPTCP
-	mapping["smux"] = proxyInfo.SMUX
-	mapping["interface"] = proxyInfo.Interface
-	mapping["routing-mark"] = proxyInfo.RoutingMark
-	mapping["provider-name"] = proxyInfo.ProviderName
-	mapping["dialer-proxy"] = proxyInfo.DialerProxy
-
-	return json.Marshal(mapping)
+	return p.legacyJSON(inner)
 }
 
 type proxyJSONAdapter struct {
