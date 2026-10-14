@@ -131,6 +131,9 @@ func (p *Proxy) MarshalJSON() ([]byte, error) {
 	if err != nil {
 		return inner, err
 	}
+	if merged, ok := p.appendMergedJSON(nil, inner); ok {
+		return merged, nil
+	}
 
 	mapping := map[string]any{}
 	_ = json.Unmarshal(inner, &mapping)
