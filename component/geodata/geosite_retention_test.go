@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"weak"
 
 	"github.com/metacubex/mihomo/component/geodata/router"
@@ -105,38 +106,59 @@ func TestGeoSiteSourceRetentionAndMatching(t *testing.T) {
 }
 
 func TestGeoSiteRetryAndConcurrentReuse(t *testing.T) {
-	var reads atomic.Int32
-	stageRetentionLoader(t, "memconservative", "succinct", func() ([]*router.Domain, error) {
-		switch reads.Add(1) {
-		case 1:
-			return nil, fmt.Errorf("temporary read failure")
-		case 2:
-			return []*router.Domain{{Type: router.Domain_Regex, Value: "["}}, nil
-		default:
-			return []*router.Domain{{Type: router.Domain_Full, Value: "recovered.example"}}, nil
-		}
-	})
-	for range 2 {
-		if _, err := LoadGeoSiteMatcher("retry"); err == nil {
-			t.Fatal("invalid source accepted")
-		}
-	}
-	var wg sync.WaitGroup
-	for range 32 {
-		wg.Go(func() {
-			matcher, err := LoadGeoSiteMatcher("retry")
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			if !matcher.ApplyDomain("recovered.example") {
-				t.Error("reloaded source did not match")
-			}
+	for _, loader := range []string{"memconservative", "standard"} {
+		t.Run(loader, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				release := make(chan struct{})
+				var reads atomic.Int32
+				stageRetentionLoader(t, loader, "succinct", func() ([]*router.Domain, error) {
+					switch reads.Add(1) {
+					case 1:
+						<-release
+						return nil, fmt.Errorf("temporary read failure")
+					case 2:
+						if loader == "memconservative" {
+							return []*router.Domain{{Type: router.Domain_Regex, Value: "["}}, nil
+						}
+					}
+					return []*router.Domain{{Type: router.Domain_Full, Value: "recovered.example"}}, nil
+				})
+				var wg sync.WaitGroup
+				for range 4 {
+					wg.Go(func() {
+						if _, err := LoadGeoSiteMatcher("retry"); err == nil {
+							t.Error("failed read accepted")
+						}
+					})
+				}
+				synctest.Wait()
+				close(release)
+				wg.Wait()
+				wantReads := int32(2)
+				if loader == "memconservative" {
+					if _, err := LoadGeoSiteMatcher("retry"); err == nil {
+						t.Fatal("invalid source accepted")
+					}
+					wantReads = 3
+				}
+				for range 32 {
+					wg.Go(func() {
+						matcher, err := LoadGeoSiteMatcher("retry")
+						if err != nil {
+							t.Error(err)
+							return
+						}
+						if !matcher.ApplyDomain("recovered.example") {
+							t.Error("reloaded source did not match")
+						}
+					})
+				}
+				wg.Wait()
+				if reads.Load() != wantReads {
+					t.Fatalf("read source %d times, want %d including the failures", reads.Load(), wantReads)
+				}
+			})
 		})
-	}
-	wg.Wait()
-	if reads.Load() != 3 {
-		t.Fatalf("read source %d times, want 3 including the failures", reads.Load())
 	}
 }
 

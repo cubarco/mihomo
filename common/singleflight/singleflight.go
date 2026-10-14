@@ -161,7 +161,7 @@ func (g *Group[T]) doCall(c *call[T], key string, fn func() (T, error)) {
 		g.mu.Lock()
 		defer g.mu.Unlock()
 		c.wg.Done()
-		if g.m[key] == c && !g.StoreResult {
+		if g.m[key] == c && (!g.StoreResult || c.err != nil) {
 			delete(g.m, key)
 		}
 
