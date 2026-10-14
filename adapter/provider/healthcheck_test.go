@@ -11,24 +11,26 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 )
 
-type countingHealthCheckProxy struct {
+type fakeHealthProxy struct {
 	C.Proxy
-	calls atomic.Int32
+	name    string
+	failed  bool
+	delay   uint16
+	probe   func(context.Context)
+	measure func(name, url, expected string)
 }
 
-type scheduledHealthProxy struct {
-	C.Proxy
-	name   string
-	failed bool
-	probe  func(context.Context)
-}
-
-func (p *scheduledHealthProxy) Name() string                      { return p.name }
-func (p *scheduledHealthProxy) AliveForTestUrl(string) bool       { return !p.failed }
-func (p *scheduledHealthProxy) LastDelayForTestUrl(string) uint16 { return 1 }
-func (p *scheduledHealthProxy) URLTest(ctx context.Context, _ string, _ utils.IntRanges[uint16]) (uint16, error) {
-	p.probe(ctx)
-	return 1, ctx.Err()
+func (p *fakeHealthProxy) Name() string                      { return p.name }
+func (p *fakeHealthProxy) AliveForTestUrl(string) bool       { return !p.failed }
+func (p *fakeHealthProxy) LastDelayForTestUrl(string) uint16 { return p.delay }
+func (p *fakeHealthProxy) URLTest(ctx context.Context, url string, expected utils.IntRanges[uint16]) (uint16, error) {
+	if p.measure != nil {
+		p.measure(p.name, url, expected.String())
+	}
+	if p.probe != nil {
+		p.probe(ctx)
+	}
+	return p.delay, ctx.Err()
 }
 
 func isolateHealthSchedule(t *testing.T) {
@@ -50,7 +52,7 @@ func TestScheduledChecksBoundAllProvidersWithoutTimingOutQueuedProbes(t *testing
 	synctest.Test(t, func(t *testing.T) {
 		isolateHealthSchedule(t)
 		var active, maximum atomic.Int32
-		blocking := &scheduledHealthProxy{name: "blocking", probe: func(ctx context.Context) {
+		blocking := &fakeHealthProxy{name: "blocking", probe: func(ctx context.Context) {
 			n := active.Add(1)
 			for previous := maximum.Load(); n > previous; previous = maximum.Load() {
 				if maximum.CompareAndSwap(previous, n) {
@@ -73,7 +75,7 @@ func TestScheduledChecksBoundAllProvidersWithoutTimingOutQueuedProbes(t *testing
 			t.Fatalf("active probes = %d", active.Load())
 		}
 		var secondCalls atomic.Int32
-		quick := &scheduledHealthProxy{name: "quick", probe: func(ctx context.Context) {
+		quick := &fakeHealthProxy{name: "quick", probe: func(ctx context.Context) {
 			secondCalls.Add(1)
 			deadline, ok := ctx.Deadline()
 			if !ok || time.Until(deadline) != time.Second {
@@ -114,7 +116,7 @@ func TestScheduledChecksCancelOnIdleAndResumeAtFreshInterval(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		isolateHealthSchedule(t)
 		var calls, canceled atomic.Int32
-		proxy := &scheduledHealthProxy{name: "idle", probe: func(ctx context.Context) {
+		proxy := &fakeHealthProxy{name: "idle", probe: func(ctx context.Context) {
 			calls.Add(1)
 			<-ctx.Done()
 			canceled.Add(1)
@@ -134,11 +136,12 @@ func TestScheduledChecksCancelOnIdleAndResumeAtFreshInterval(t *testing.T) {
 		if calls.Load() != 1 {
 			t.Fatal("idle timer started another health check")
 		}
-		manual := &countingHealthCheckProxy{}
+		var manualCalls atomic.Int32
+		manual := &fakeHealthProxy{name: "manual", probe: func(context.Context) { manualCalls.Add(1) }}
 		manualHC := NewHealthCheck([]C.Proxy{manual}, "https://probe.test/", 1000, 0, false, nil)
 		manualHC.check()
 		manualHC.close()
-		if manual.calls.Load() != 1 {
+		if manualCalls.Load() != 1 {
 			t.Fatal("idle disabled explicit health checks")
 		}
 		SetHealthCheckState(false, false)
@@ -162,55 +165,57 @@ func TestScheduledChecksPrioritizeFailedAndSelectedNodes(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		isolateHealthSchedule(t)
 		SetHealthCheckPriority(func() map[string]struct{} { return map[string]struct{}{"selected": {}} })
-		started := make(chan string, 20)
-		makeProxy := func(name string, failed bool) C.Proxy {
-			return &scheduledHealthProxy{name: name, failed: failed, probe: func(ctx context.Context) { started <- name; <-ctx.Done() }}
-		}
+		started := make(chan string, 30)
 		var proxies []C.Proxy
-		for range 15 {
-			proxies = append(proxies, makeProxy("other", false))
+		add := func(name string, failed bool, count int) {
+			for range count {
+				proxies = append(proxies, &fakeHealthProxy{name: name, failed: failed, probe: func(ctx context.Context) { started <- name; <-ctx.Done() }})
+			}
 		}
-		proxies = append(proxies, makeProxy("selected", false), makeProxy("failed", true))
+		add("other", false, 15)
+		add("failed", true, 12)
+		add("selected", false, 1)
 		hc := NewHealthCheck(proxies, "https://probe.test/", 5000, 0, false, nil)
 		defer hc.close()
 		done := make(chan struct{})
 		go func() { hc.checkScheduled(); close(done) }()
 		synctest.Wait()
-		seen := make(map[string]bool)
-		for range backgroundHealthCheckLimit {
-			seen[<-started] = true
+		seen := make(map[string]int)
+		for range len(started) {
+			seen[<-started]++
 		}
-		if !seen["failed"] || !seen["selected"] {
-			t.Fatal("recovery and selected nodes were queued behind unused nodes")
+		if seen["selected"] != 1 || seen["failed"] != backgroundHealthCheckLimit-1 || seen["other"] != 0 {
+			t.Fatalf("first probes = %v, want the selected node, then failed nodes", seen)
 		}
 		hc.close()
 		<-done
 	})
 }
 
-func (p *countingHealthCheckProxy) Name() string {
-	return "counting"
-}
-
-func (p *countingHealthCheckProxy) URLTest(
-	context.Context,
-	string,
-	utils.IntRanges[uint16],
-) (uint16, error) {
-	p.calls.Add(1)
-	return 1, nil
-}
-
-func (p *countingHealthCheckProxy) AliveForTestUrl(string) bool {
-	return true
-}
-
-func (p *countingHealthCheckProxy) LastDelayForTestUrl(string) uint16 {
-	return 1
+func TestRecoveryCheckProbesSelectedNodeBeforeDeadNodes(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		isolateHealthSchedule(t)
+		SetHealthCheckPriority(func() map[string]struct{} { return map[string]struct{}{"selected": {}} })
+		var proxies []C.Proxy
+		for range 30 {
+			proxies = append(proxies, &fakeHealthProxy{name: "dead", failed: true, probe: func(ctx context.Context) { <-ctx.Done() }})
+		}
+		began := time.Now()
+		var waited time.Duration
+		proxies = append(proxies, &fakeHealthProxy{name: "selected", probe: func(context.Context) { waited = time.Since(began) }})
+		hc := NewHealthCheck(proxies, "https://probe.test/", 5000, 0, false, nil)
+		defer hc.close()
+		(&baseProvider{healthCheck: hc}).HealthCheckBackground()
+		if waited != 0 {
+			t.Fatalf("failing selected node waited %v behind dead nodes", waited)
+		}
+	})
 }
 
 func TestHealthCheckSuspendedBlocksManualChecks(t *testing.T) {
-	proxy := &countingHealthCheckProxy{}
+	isolateHealthSchedule(t)
+	var calls atomic.Int32
+	proxy := &fakeHealthProxy{name: "counting", probe: func(context.Context) { calls.Add(1) }}
 	healthCheck := NewHealthCheck(
 		[]C.Proxy{proxy},
 		"https://example.com/generate_204",
@@ -220,19 +225,19 @@ func TestHealthCheckSuspendedBlocksManualChecks(t *testing.T) {
 		nil,
 	)
 	t.Cleanup(func() {
-		SetHealthCheckSuspended(false)
+		SetHealthCheckState(false, false)
 		healthCheck.close()
 	})
 
-	SetHealthCheckSuspended(true)
+	SetHealthCheckState(true, true)
 	healthCheck.check()
-	if got := proxy.calls.Load(); got != 0 {
+	if got := calls.Load(); got != 0 {
 		t.Fatalf("suspended health check calls = %d", got)
 	}
 
-	SetHealthCheckSuspended(false)
+	SetHealthCheckState(false, false)
 	healthCheck.check()
-	if got := proxy.calls.Load(); got != 1 {
+	if got := calls.Load(); got != 1 {
 		t.Fatalf("active health check calls = %d", got)
 	}
 }

@@ -222,9 +222,13 @@ func (hc *HealthCheck) checkWithContext(ctx context.Context, mode healthCheckMod
 		b := new(errgroup.Group)
 		b.SetLimit(10)
 		began := time.Now()
+		var selected map[string]struct{}
+		if priority := healthCheckPriority.Load(); mode != healthCheckManual && priority != nil {
+			selected = priority()
+		}
 		nextWindows := make(map[string]int)
 		execute := func(url string, option *extraOption) {
-			if next := hc.execute(ctx, b, proxies, url, id, option, mode, began); next >= 0 {
+			if next := hc.execute(ctx, b, proxies, url, id, option, mode, began, selected); next >= 0 {
 				nextWindows[strings.TrimSpace(url)] = next
 			}
 		}
@@ -255,7 +259,7 @@ func (hc *HealthCheck) checkWithContext(ctx context.Context, mode healthCheckMod
 	})
 }
 
-func (hc *HealthCheck) execute(ctx context.Context, b *errgroup.Group, proxies []C.Proxy, url, uid string, option *extraOption, mode healthCheckMode, began time.Time) int {
+func (hc *HealthCheck) execute(ctx context.Context, b *errgroup.Group, proxies []C.Proxy, url, uid string, option *extraOption, mode healthCheckMode, began time.Time, selected map[string]struct{}) int {
 	if ctx.Err() != nil {
 		return -1
 	}
@@ -285,10 +289,6 @@ func (hc *HealthCheck) execute(ctx context.Context, b *errgroup.Group, proxies [
 	}
 
 	background := mode != healthCheckManual
-	var selected map[string]struct{}
-	if priority := healthCheckPriority.Load(); background && priority != nil {
-		selected = priority()
-	}
 	nextWindow := -1
 	if mode == healthCheckScheduled && len(proxies) > healthCheckWindowSize {
 		var err error

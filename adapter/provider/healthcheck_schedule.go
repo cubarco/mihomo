@@ -59,10 +59,6 @@ func SetHealthCheckState(idle, suspended bool) {
 	backgroundHealthChecks.setPaused(idle || suspended)
 }
 
-func SetHealthCheckSuspended(suspended bool) {
-	SetHealthCheckState(suspended, suspended)
-}
-
 func BackgroundHealthChecksPaused() bool {
 	paused, _, _ := backgroundHealthChecks.state()
 	return paused
@@ -75,11 +71,10 @@ func SetHealthCheckPriority(priority func() map[string]struct{}) {
 func prioritizeHealthChecks(proxies []C.Proxy, url string, selected map[string]struct{}) []C.Proxy {
 	var buckets [3][]C.Proxy
 	for _, proxy := range proxies {
-		_, chosen := selected[proxy.Name()]
 		priority := 2
-		if !proxy.AliveForTestUrl(url) {
+		if _, chosen := selected[proxy.Name()]; chosen {
 			priority = 0
-		} else if chosen {
+		} else if !proxy.AliveForTestUrl(url) {
 			priority = 1
 		}
 		buckets[priority] = append(buckets[priority], proxy)

@@ -15,18 +15,6 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 )
 
-type windowHealthProxy struct {
-	*scheduledHealthProxy
-	delay   uint16
-	measure func(string, string, string)
-}
-
-func (p *windowHealthProxy) LastDelayForTestUrl(string) uint16 { return p.delay }
-func (p *windowHealthProxy) URLTest(_ context.Context, url string, expected utils.IntRanges[uint16]) (uint16, error) {
-	p.measure(p.name, url, expected.String())
-	return p.delay, nil
-}
-
 type windowMeasurements struct {
 	sync.Mutex
 	byURL map[string]map[string]int
@@ -47,11 +35,7 @@ func (m *windowMeasurements) record(name, url, _ string) {
 func windowTestProxies(count int, measure func(string, string, string)) []C.Proxy {
 	proxies := make([]C.Proxy, count)
 	for i := range proxies {
-		proxies[i] = &windowHealthProxy{
-			scheduledHealthProxy: &scheduledHealthProxy{name: fmt.Sprintf("node-%04d", i)},
-			delay:                0xffff,
-			measure:              measure,
-		}
+		proxies[i] = &fakeHealthProxy{name: fmt.Sprintf("node-%04d", i), delay: 0xffff, measure: measure}
 	}
 	return proxies
 }
@@ -65,15 +49,15 @@ func TestScheduledHealthCheckRotatesLargeProviders(t *testing.T) {
 				var measured windowMeasurements
 				proxies := windowTestProxies(3000, measured.record)
 				for _, proxy := range proxies {
-					proxy.(*windowHealthProxy).delay = 1000
+					proxy.(*fakeHealthProxy).delay = 1000
 				}
 				for i := 2700; i < 2764; i++ {
-					proxies[i].(*windowHealthProxy).delay = uint16(i - 2699)
+					proxies[i].(*fakeHealthProxy).delay = uint16(i - 2699)
 				}
-				proxies[2998].(*windowHealthProxy).failed = true
+				proxies[2998].(*fakeHealthProxy).failed = true
 				if manyFailed {
 					for i := range 2000 {
-						proxies[i].(*windowHealthProxy).failed = true
+						proxies[i].(*fakeHealthProxy).failed = true
 					}
 				}
 				SetHealthCheckPriority(func() map[string]struct{} {
@@ -129,7 +113,7 @@ func TestHealthCheckWindowsRespectFiltersAndIndependentURLs(t *testing.T) {
 		return map[string]struct{}{"node-4999": {}}
 	})
 	for i, proxy := range proxies {
-		p := proxy.(*windowHealthProxy)
+		p := proxy.(*fakeHealthProxy)
 		p.delay = uint16(i + 1)
 		p.measure = func(name, url, expected string) {
 			last := name[len(name)-1]
@@ -248,7 +232,7 @@ func TestCanceledHealthCheckWindowRetriesUnfinishedNodes(t *testing.T) {
 		proxies := make([]C.Proxy, 1500)
 		for i := range proxies {
 			name := fmt.Sprintf("node-%04d", i)
-			proxies[i] = &scheduledHealthProxy{name: name, probe: func(ctx context.Context) {
+			proxies[i] = &fakeHealthProxy{name: name, probe: func(ctx context.Context) {
 				measured.record(name, url, "")
 				if blocking.Load() {
 					<-ctx.Done()
@@ -286,7 +270,7 @@ func TestHealthCheckWindowKeepsSnapshotDuringProviderReplacement(t *testing.T) {
 		proxies := make([]C.Proxy, 2500)
 		for i := range proxies {
 			name := fmt.Sprintf("node-%04d", i)
-			proxies[i] = &scheduledHealthProxy{name: name, probe: func(context.Context) {
+			proxies[i] = &fakeHealthProxy{name: name, probe: func(context.Context) {
 				original.record(name, url, "")
 				<-release
 			}}
@@ -317,8 +301,8 @@ func TestHealthCheckWindowStopsOnFilterTimeout(t *testing.T) {
 	isolateHealthSchedule(t)
 	var measured windowMeasurements
 	proxies := windowTestProxies(1001, measured.record)
-	proxies[0].(*windowHealthProxy).name = "a"
-	proxies[1].(*windowHealthProxy).name = strings.Repeat("a", 512) + "!"
+	proxies[0].(*fakeHealthProxy).name = "a"
+	proxies[1].(*fakeHealthProxy).name = strings.Repeat("a", 512) + "!"
 	hc := NewHealthCheck(proxies, "", 1000, 0, false, nil)
 	defer hc.close()
 	hc.registerHealthCheckTask("https://probe.invalid/", nil, "^(a+)+$", 0)
