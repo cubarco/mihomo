@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -950,6 +951,7 @@ func (z *ZeroTier) applyNetworkConfig(config ZT.NetworkConfigData, generation ui
 	}
 	oldDevice := z.tunDevice
 	oldConfig := z.config
+	oldResolver := z.resolver
 	z.stateMu.RUnlock()
 	if runtime == nil {
 		return errors.New("ZeroTier core is not started")
@@ -958,11 +960,15 @@ func (z *ZeroTier) applyNetworkConfig(config ZT.NetworkConfigData, generation ui
 	if len(config.Assigned) == 0 {
 		return errors.New("ZeroTier controller assigned no managed addresses")
 	}
-	remoteResolver, err := z.resolverForNetworkConfig(config)
-	if err != nil {
-		return err
+	var err error
+	remoteResolver := oldResolver
+	reuseResolver := oldResolver != nil && z.sameDNSInputs(oldConfig, config)
+	if !reuseResolver {
+		if remoteResolver, err = z.resolverForNetworkConfig(config); err != nil {
+			return err
+		}
+		defer func() { remoteResolver.close() }()
 	}
-	defer func() { remoteResolver.close() }()
 	mtu := z.effectiveMTU(config)
 	replaceDevice := oldDevice == nil || !oldConfig.ManagedAddressesEqual(config) || z.effectiveMTU(oldConfig) != mtu
 	device := oldDevice
@@ -1026,7 +1032,9 @@ func (z *ZeroTier) applyNetworkConfig(config ZT.NetworkConfigData, generation ui
 	z.configGeneration++
 	z.notifyStateLocked()
 	z.stateMu.Unlock()
-	replacedResolver.close()
+	if !reuseResolver {
+		replacedResolver.close()
+	}
 	if !replaceDevice {
 		return nil
 	}
@@ -1062,6 +1070,10 @@ func (z *ZeroTier) effectiveMTU(config ZT.NetworkConfigData) uint32 {
 		mtu = uint32(z.option.MTU)
 	}
 	return mtu
+}
+
+func (z *ZeroTier) sameDNSInputs(a, b ZT.NetworkConfigData) bool {
+	return a.HasManagedIPv6() == b.HasManagedIPv6() && (len(z.dns) != 0 || slices.Equal(a.DNSServers, b.DNSServers))
 }
 
 func (z *ZeroTier) resolverForNetworkConfig(config ZT.NetworkConfigData) (*nodeDNS, error) {

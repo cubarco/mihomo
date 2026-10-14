@@ -5,6 +5,7 @@ package outbound
 import (
 	"context"
 	"errors"
+	"net"
 	"net/netip"
 	"testing"
 	"time"
@@ -56,6 +57,25 @@ func TestZeroTierDNSConfigurationStaysLazy(t *testing.T) {
 	require.Nil(t, disabled)
 }
 
+func TestZeroTierDNSReuseFollowsEffectiveServers(t *testing.T) {
+	node := zeroTierDNSFixture(t)
+	base := ZT.NetworkConfigData{
+		Timestamp:  1,
+		Assigned:   []netip.Prefix{netip.MustParsePrefix("192.0.2.2/24")},
+		DNSServers: []netip.AddrPort{netip.MustParseAddrPort("192.0.2.53:53")},
+	}
+	refreshed, moved, ipv6 := base, base, base
+	refreshed.Timestamp++
+	moved.DNSServers = []netip.AddrPort{netip.MustParseAddrPort("198.51.100.53:53")}
+	ipv6.Assigned = append(append([]netip.Prefix(nil), base.Assigned...), netip.MustParsePrefix("2001:db8::2/64"))
+	require.True(t, node.sameDNSInputs(base, refreshed))
+	require.False(t, node.sameDNSInputs(base, moved))
+	require.False(t, node.sameDNSInputs(base, ipv6))
+	node.dns = []dns.NameServer{{Addr: "203.0.113.53:53"}}
+	require.True(t, node.sameDNSInputs(base, moved))
+	require.False(t, node.sameDNSInputs(base, ipv6))
+}
+
 func TestZeroTierSessionRetiresPrivateDNS(t *testing.T) {
 	for _, event := range []string{"close", "network failure", "stack failure"} {
 		t.Run(event, func(t *testing.T) {
@@ -78,7 +98,7 @@ func TestZeroTierSessionRetiresPrivateDNS(t *testing.T) {
 			require.Nil(t, node.resolver)
 			require.Nil(t, owner.current)
 			_, err := owner.get(context.Background())
-			require.ErrorIs(t, err, context.Canceled)
+			require.ErrorIs(t, err, net.ErrClosed)
 			select {
 			case <-device.closed:
 			case <-time.After(time.Second):
@@ -151,8 +171,20 @@ func TestZeroTierDNSReplacementAndRejectedUpdates(t *testing.T) {
 	}
 	node.config, node.latestConfig, node.haveLatestConfig = config, config, true
 	node.tunDevice = &sessionDNSStack{closed: make(chan struct{})}
-	owner, _, assertRetired := blockedSessionDNS(t)
+	owner, inFlight, assertRetired := blockedSessionDNS(t)
 	node.resolver = owner
+	refreshed := config
+	refreshed.Timestamp++
+	node.latestConfig = refreshed
+	require.NoError(t, node.applyNetworkConfig(refreshed, node.configGeneration))
+	require.Same(t, owner, node.resolver)
+	require.False(t, owner.closed)
+	reused, err := owner.get(context.Background())
+	require.NoError(t, err)
+	require.Same(t, inFlight, reused)
+	config = refreshed
+	config.DNSServers = []netip.AddrPort{netip.MustParseAddrPort("203.0.113.53:53")}
+	node.latestConfig = config
 	require.NoError(t, node.applyNetworkConfig(config, node.configGeneration))
 	assertRetired()
 	current := node.resolver

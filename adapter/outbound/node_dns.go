@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"net"
 	"sync"
 
 	"github.com/metacubex/mihomo/component/resolver"
@@ -23,7 +24,7 @@ func (d *nodeDNS) get(ctx context.Context) (resolver.Resolver, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {
-		return nil, context.Canceled
+		return nil, net.ErrClosed
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

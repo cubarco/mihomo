@@ -54,7 +54,7 @@ func TestNodeDNSConstructionAndTerminalClose(t *testing.T) {
 				require.NoError(t, node.Close())
 				require.Nil(t, owner.servers)
 				_, err = owner.get(context.Background())
-				require.ErrorIs(t, err, context.Canceled)
+				require.ErrorIs(t, err, net.ErrClosed)
 				require.Nil(t, owner.current)
 			}
 		})
@@ -73,7 +73,7 @@ func TestNodeDNSConcurrentCreationAndClose(t *testing.T) {
 					r, err := owner.get(context.Background())
 					if err == nil {
 						instances <- r
-					} else if !raceClose || !errors.Is(err, context.Canceled) {
+					} else if !raceClose || !errors.Is(err, net.ErrClosed) {
 						t.Errorf("first use: %v", err)
 					}
 				})
@@ -99,7 +99,7 @@ func TestNodeDNSConcurrentCreationAndClose(t *testing.T) {
 			require.Nil(t, owner.current)
 			require.Nil(t, owner.servers)
 			_, err := owner.get(context.Background())
-			require.ErrorIs(t, err, context.Canceled)
+			require.ErrorIs(t, err, net.ErrClosed)
 		})
 	}
 }
@@ -205,7 +205,7 @@ func TestNodeDNSPreservesRoutingCacheAndFamily(t *testing.T) {
 	require.EqualValues(t, 3, proxy.calls.Load())
 	owner.close()
 	_, err = owner.get(context.Background())
-	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, net.ErrClosed)
 
 	previous := resolver.DefaultResolver
 	global := dns.NewResolver(dns.Config{Main: []dns.NameServer{{Net: "rcode", Addr: "success"}}})
@@ -219,5 +219,5 @@ func TestNodeDNSPreservesRoutingCacheAndFamily(t *testing.T) {
 	_, err = fallback.ExchangeContext(context.Background(), new(D.Msg).SetQuestion("global.test.", D.TypeA))
 	require.NoError(t, err)
 	_, err = owner.get(context.Background())
-	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, net.ErrClosed)
 }
