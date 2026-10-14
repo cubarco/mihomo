@@ -31,10 +31,7 @@ func WriteProxyJSON(w io.Writer, proxy C.Proxy) error {
 	if err != nil {
 		return err
 	}
-	n, err := w.Write(data)
-	if err == nil && n != len(data) {
-		err = io.ErrShortWrite
-	}
+	_, err = w.Write(data)
 	return err
 }
 
@@ -50,13 +47,13 @@ func (p *Proxy) appendMergedJSON(b, inner []byte) ([]byte, bool) {
 	}
 	fields := append(make([]jsonMember, 0, 24), []jsonMember{
 		{key: "alive", value: jsonBool(p.alive.Load())},
-		{key: "dialer-proxy", value: appendJSONString(nil, info.DialerProxy)},
+		{key: "dialer-proxy", value: AppendJSONString(nil, info.DialerProxy)},
 		{key: "extra", value: extra},
 		{key: "history", value: history},
-		{key: "interface", value: appendJSONString(nil, info.Interface)},
+		{key: "interface", value: AppendJSONString(nil, info.Interface)},
 		{key: "mptcp", value: jsonBool(info.MPTCP)},
-		{key: "name", value: appendJSONString(nil, p.Name())},
-		{key: "provider-name", value: appendJSONString(nil, info.ProviderName)},
+		{key: "name", value: AppendJSONString(nil, p.Name())},
+		{key: "provider-name", value: AppendJSONString(nil, info.ProviderName)},
 		{key: "routing-mark", value: strconv.AppendInt(nil, int64(info.RoutingMark), 10)},
 		{key: "smux", value: jsonBool(info.SMUX)},
 		{key: "tfo", value: jsonBool(info.TFO)},
@@ -86,7 +83,7 @@ func (p *Proxy) appendMergedJSON(b, inner []byte) ([]byte, bool) {
 		if i > 0 {
 			b = append(b, ',')
 		}
-		b = appendJSONString(b, field.key)
+		b = AppendJSONString(b, field.key)
 		b = append(b, ':')
 		b = append(b, field.value...)
 	}
@@ -304,7 +301,7 @@ func (s *jsonScan) scanString(decode bool) (string, bool) {
 	if json.Unmarshal(raw, &value) != nil {
 		return "", false
 	}
-	if !plain && !bytes.Equal(appendJSONString(nil, value), raw) {
+	if !plain && !bytes.Equal(AppendJSONString(nil, value), raw) {
 		return "", false
 	}
 	return value, true
@@ -336,7 +333,8 @@ func appendDelayHistory(b []byte, records []C.DelayHistory, nilWhenEmpty bool) (
 	return append(b, ']'), nil
 }
 
-func appendJSONString(b []byte, s string) []byte {
+// AppendJSONString appends s as encoding/json marshals it.
+func AppendJSONString(b []byte, s string) []byte {
 	start := len(b)
 	b = append(b, '"')
 	b = append(b, s...)
@@ -378,7 +376,7 @@ func (p *Proxy) appendExtraJSON(b []byte) ([]byte, error) {
 		if i > 0 {
 			b = append(b, ',')
 		}
-		b = appendJSONString(b, entry.url)
+		b = AppendJSONString(b, entry.url)
 		b = append(b, `:{"alive":`...)
 		b = strconv.AppendBool(b, entry.state.alive.Load())
 		b = append(b, `,"history":`...)

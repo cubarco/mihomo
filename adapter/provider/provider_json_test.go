@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"sync"
 	"testing"
 	"time"
@@ -124,18 +123,4 @@ func TestProviderJSONConcurrentInlineUpdates(t *testing.T) {
 		})
 	}
 	group.Wait()
-	p.setProxies(nodes)
-	var writes int
-	for _, n := range []int{0, 1, 2, 3, 4, 5} {
-		writes = 0
-		err := WriteJSON(context.Background(), providerJSONWriter(func(data []byte) (int, error) {
-			writes++
-			if writes > n {
-				return 0, nil
-			}
-			return len(data), nil
-		}), p)
-		require.ErrorIs(t, err, io.ErrShortWrite)
-		require.Equal(t, n+1, writes)
-	}
 }

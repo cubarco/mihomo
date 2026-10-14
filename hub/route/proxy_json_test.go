@@ -173,7 +173,7 @@ func (w *controllerJSONWriter) Write(p []byte) (int, error) { return w.write(p) 
 func TestControllerJSONStopsEncodingAbandonedLists(t *testing.T) {
 	const count = 1000
 	for _, kind := range []string{"proxies", "provider", "providers"} {
-		for _, stop := range []string{"canceled before start", "canceled during write", "write failed", "short write"} {
+		for _, stop := range []string{"canceled before start", "canceled during write", "write failed"} {
 			t.Run(kind+"/"+stop, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
@@ -195,8 +195,6 @@ func TestControllerJSONStopsEncodingAbandonedLists(t *testing.T) {
 						cancel()
 					case "write failed":
 						return 0, io.ErrClosedPipe
-					case "short write":
-						return len(data) - 1, nil
 					}
 					return len(data), nil
 				}}

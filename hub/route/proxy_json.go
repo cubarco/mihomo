@@ -2,8 +2,6 @@ package route
 
 import (
 	"bufio"
-	"encoding/json"
-	"io"
 	"slices"
 
 	"github.com/metacubex/mihomo/adapter"
@@ -34,11 +32,7 @@ func (w *jsonResponseWriter) Write(data []byte) (int, error) {
 			w.WriteHeader(status)
 		}
 	}
-	n, err := w.ResponseWriter.Write(data)
-	if err == nil && n != len(data) {
-		err = io.ErrShortWrite
-	}
-	return n, err
+	return w.ResponseWriter.Write(data)
 }
 
 type jsonStream struct {
@@ -47,7 +41,7 @@ type jsonStream struct {
 	err     error
 }
 
-func (s *jsonStream) ok() bool {
+func (s *jsonStream) next() bool {
 	if s.err == nil {
 		s.err = s.request.Context().Err()
 	}
@@ -55,43 +49,39 @@ func (s *jsonStream) ok() bool {
 }
 
 func (s *jsonStream) text(value string) {
-	if s.ok() {
+	if s.err == nil {
 		_, s.err = s.writer.WriteString(value)
 	}
 }
 
-func (s *jsonStream) value(value any) {
-	if !s.ok() {
-		return
-	}
-	var data []byte
-	data, s.err = json.Marshal(value)
-	if s.ok() {
-		_, s.err = s.writer.Write(data)
+func (s *jsonStream) key(name string) {
+	if s.err == nil {
+		_, s.err = s.writer.Write(adapter.AppendJSONString(s.writer.AvailableBuffer(), name))
 	}
 }
 
 func (s *jsonStream) provider(value P.ProxyProvider) {
-	if s.ok() {
+	if s.err == nil {
 		s.err = provider.WriteJSON(s.request.Context(), s.writer, value)
 	}
 }
 
 func (s *jsonStream) proxy(value C.Proxy) {
-	if s.ok() {
+	if s.err == nil {
 		s.err = adapter.WriteProxyJSON(s.writer, value)
 	}
 }
 
 func streamJSON(w http.ResponseWriter, r *http.Request, write func(*jsonStream)) {
-	if r.Context().Err() != nil {
+	s := &jsonStream{request: r}
+	if !s.next() {
 		return
 	}
 	response := &jsonResponseWriter{ResponseWriter: w, request: r}
-	s := &jsonStream{writer: bufio.NewWriterSize(response, proxyJSONBufferSize), request: r}
+	s.writer = bufio.NewWriterSize(response, proxyJSONBufferSize)
 	write(s)
 	s.text("\n")
-	if s.ok() {
+	if s.err == nil {
 		s.err = s.writer.Flush()
 	}
 	if s.err != nil {
@@ -106,9 +96,6 @@ func streamJSON(w http.ResponseWriter, r *http.Request, write func(*jsonStream))
 }
 
 func streamJSONMap[V any](s *jsonStream, values map[string]V, write func(V)) {
-	if !s.ok() {
-		return
-	}
 	if values == nil {
 		s.text("null")
 		return
@@ -120,17 +107,15 @@ func streamJSONMap[V any](s *jsonStream, values map[string]V, write func(V)) {
 	slices.Sort(names)
 	s.text("{")
 	for i, name := range names {
-		if !s.ok() {
+		if !s.next() {
 			return
 		}
 		if i > 0 {
 			s.text(",")
 		}
-		s.value(name)
+		s.key(name)
 		s.text(":")
-		if s.ok() {
-			write(values[name])
-		}
+		write(values[name])
 	}
 	s.text("}")
 }

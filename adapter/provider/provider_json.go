@@ -15,31 +15,13 @@ import (
 // WriteJSON streams a provider snapshot without buffering its complete node list.
 // Callers should buffer small writes and discard any partial response on error.
 func WriteJSON(ctx context.Context, w io.Writer, provider P.ProxyProvider) error {
-	if err := ctx.Err(); err != nil {
+	head, ok := apiSnapshot(provider)
+	if !ok {
+		data, err := json.Marshal(provider)
+		if err == nil {
+			_, err = w.Write(data)
+		}
 		return err
-	}
-	var head providerForApi
-	switch p := provider.(type) {
-	case *ProxySetProvider:
-		if p != nil {
-			head = p.apiSnapshot()
-			break
-		}
-		return writeJSONValue(w, provider)
-	case *InlineProvider:
-		if p != nil {
-			head = p.apiSnapshot()
-			break
-		}
-		return writeJSONValue(w, provider)
-	case *CompatibleProvider:
-		if p != nil {
-			head = p.apiSnapshot()
-			break
-		}
-		return writeJSONValue(w, provider)
-	default:
-		return writeJSONValue(w, provider)
 	}
 	proxies := head.Proxies
 	head.Proxies = nil
@@ -48,18 +30,14 @@ func WriteJSON(ctx context.Context, w io.Writer, provider P.ProxyProvider) error
 		return &json.MarshalerError{Type: reflect.TypeOf(provider), Err: err}
 	}
 	if proxies == nil {
-		return writeJSONBytes(w, encoded)
-	}
-	const marker = `"proxies":null`
-	at := bytes.Index(encoded, []byte(marker))
-	if at < 0 {
-		return errors.New("provider JSON without proxies")
-	}
-	at += len(`"proxies":`)
-	if err := writeJSONBytes(w, encoded[:at]); err != nil {
+		_, err = w.Write(encoded)
 		return err
 	}
-	if err := writeJSONText(w, "["); err != nil {
+	before, after, _ := bytes.Cut(encoded, []byte(`"proxies":null`))
+	if _, err := w.Write(before); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, `"proxies":[`); err != nil {
 		return err
 	}
 	for i, proxy := range proxies {
@@ -67,7 +45,7 @@ func WriteJSON(ctx context.Context, w io.Writer, provider P.ProxyProvider) error
 			return err
 		}
 		if i > 0 {
-			if err := writeJSONText(w, ","); err != nil {
+			if _, err := io.WriteString(w, ","); err != nil {
 				return err
 			}
 		}
@@ -79,35 +57,27 @@ func WriteJSON(ctx context.Context, w io.Writer, provider P.ProxyProvider) error
 			return err
 		}
 	}
-	if err := ctx.Err(); err != nil {
+	if _, err := io.WriteString(w, "]"); err != nil {
 		return err
 	}
-	if err := writeJSONText(w, "]"); err != nil {
-		return err
-	}
-	return writeJSONBytes(w, encoded[at+len("null"):])
-}
-
-func writeJSONValue(w io.Writer, value any) error {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	return writeJSONBytes(w, data)
-}
-
-func writeJSONBytes(w io.Writer, data []byte) error {
-	n, err := w.Write(data)
-	if err == nil && n != len(data) {
-		err = io.ErrShortWrite
-	}
+	_, err = w.Write(after)
 	return err
 }
 
-func writeJSONText(w io.Writer, text string) error {
-	n, err := io.WriteString(w, text)
-	if err == nil && n != len(text) {
-		err = io.ErrShortWrite
+func apiSnapshot(provider P.ProxyProvider) (providerForApi, bool) {
+	switch p := provider.(type) {
+	case *ProxySetProvider:
+		if p != nil {
+			return p.apiSnapshot(), true
+		}
+	case *InlineProvider:
+		if p != nil {
+			return p.apiSnapshot(), true
+		}
+	case *CompatibleProvider:
+		if p != nil {
+			return p.apiSnapshot(), true
+		}
 	}
-	return err
+	return providerForApi{}, false
 }
