@@ -3,6 +3,7 @@ package outboundgroup
 import (
 	"strings"
 	"testing"
+	"time"
 
 	C "github.com/metacubex/mihomo/constant"
 	P "github.com/metacubex/mihomo/constant/provider"
@@ -51,5 +52,28 @@ func TestGroupFilterTimeoutPreservesSelectionUntilProviderChanges(t *testing.T) 
 	pd.proxies = []C.Proxy{repaired}
 	if got := group.GetProxies(false); len(got) != 1 || got[0] != repaired {
 		t.Fatal("provider update did not retry the filter")
+	}
+}
+
+func TestGroupFilterTimeoutExpiresWithoutProviderChange(t *testing.T) {
+	fallback := &regexGroupProxy{name: "fallback"}
+	pd := &regexGroupProvider{version: 1, proxies: []C.Proxy{&regexGroupProxy{name: strings.Repeat("a", 512) + "!"}}}
+	group := NewGroupBase(GroupBaseOption{Name: "test", Filter: `^(a+)+$`, Providers: []P.ProxyProvider{pd}, EmptyFallback: fallback})
+	if got := group.GetProxies(false); len(got) != 1 || got[0] != fallback {
+		t.Fatal("failed first evaluation did not use the fallback")
+	}
+	recovered := &regexGroupProxy{name: "aaa"}
+	pd.proxies = []C.Proxy{recovered}
+	if got := group.GetProxies(false); len(got) != 1 || got[0] != fallback {
+		t.Fatal("known failing filter was retried before its backoff")
+	}
+	group.filterRetryAt = time.Now().Add(-time.Nanosecond)
+	if got := group.GetProxies(false); len(got) != 1 || got[0] != recovered {
+		t.Fatal("filter failure outlived its backoff on an unchanged provider")
+	}
+	reads := recovered.reads
+	group.GetProxies(false)
+	if recovered.reads != reads {
+		t.Fatal("successful retry was not cached")
 	}
 }

@@ -11,6 +11,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/metacubex/mihomo/adapter"
+	"github.com/metacubex/mihomo/adapter/outbound"
 	"github.com/metacubex/mihomo/adapter/provider"
 	"github.com/metacubex/mihomo/common/utils"
 	C "github.com/metacubex/mihomo/constant"
@@ -133,6 +135,34 @@ func TestGroupURLTestCancellationStopsQueuedProbes(t *testing.T) {
 		t.Fatal("canceled group test did not finish")
 	}
 	require.EqualValues(t, 64, calls.Load())
+}
+
+type dialCountingAdapter struct {
+	C.ProxyAdapter
+	dials *atomic.Int32
+}
+
+func (a dialCountingAdapter) DialContext(context.Context, *C.Metadata) (C.Conn, error) {
+	a.dials.Add(1)
+	return nil, errors.New("fixture dial")
+}
+
+func TestGroupURLTestCanceledCallerStartsNoProbes(t *testing.T) {
+	var dials atomic.Int32
+	proxies := make([]C.Proxy, 4*groupTestConcurrency)
+	for i := range proxies {
+		base := outbound.NewBase(outbound.BaseOption{Name: fmt.Sprint(i), Type: C.Http})
+		proxies[i] = adapter.NewProxy(dialCountingAdapter{ProxyAdapter: base, dials: &dials})
+	}
+	group, _ := efficiencyGroup(t, 0, proxies...)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := group.URLTest(ctx, "", nil)
+	require.Error(t, err)
+	require.Zero(t, dials.Load())
+	_, err = group.URLTest(context.Background(), "", nil)
+	require.Error(t, err)
+	require.EqualValues(t, len(proxies), dials.Load())
 }
 
 func TestGroupURLTestCollectsAllResults(t *testing.T) {

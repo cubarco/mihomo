@@ -40,6 +40,7 @@ type GroupBase struct {
 	getProxiesMutex  sync.Mutex
 	providerVersions []uint32
 	providerProxies  []C.Proxy
+	filterRetryAt    time.Time
 }
 
 type GroupBaseOption struct {
@@ -133,7 +134,7 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 	defer gb.getProxiesMutex.Unlock()
 
 	// return the cached proxies if version not changed
-	if slices.Equal(providerVersions, gb.providerVersions) {
+	if slices.Equal(providerVersions, gb.providerVersions) && (gb.filterRetryAt.IsZero() || time.Now().Before(gb.filterRetryAt)) {
 		return gb.providerProxies
 	}
 	var filterError error
@@ -235,6 +236,7 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 	if filterError != nil {
 		log.Errorln("Proxy group %s filter evaluation failed; keeping the last selection: %v", gb.Name(), filterError)
 		gb.providerVersions = providerVersions
+		gb.filterRetryAt = time.Now().Add(filterRetryInterval)
 		if len(gb.providerProxies) == 0 {
 			gb.providerProxies = []C.Proxy{gb.EmptyFallback()}
 		}
@@ -247,6 +249,7 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 	// only cache when proxies not empty
 	gb.providerVersions = providerVersions
 	gb.providerProxies = proxies
+	gb.filterRetryAt = time.Time{}
 
 	return proxies
 }
@@ -264,17 +267,10 @@ schedule:
 			break schedule
 		case running <- struct{}{}:
 		}
-		if ctx.Err() != nil {
-			<-running
-			break
-		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			defer func() { <-running }()
-			if ctx.Err() != nil {
-				return
-			}
 			delay, err := proxy.URLTest(ctx, url, expectedStatus)
 			if err == nil {
 				lock.Lock()
@@ -363,4 +359,5 @@ func (gb *GroupBase) onDialSuccess() {
 const (
 	groupTestConcurrency = 64
 	failedCheckCooldown  = time.Second
+	filterRetryInterval  = 30 * time.Second
 )
