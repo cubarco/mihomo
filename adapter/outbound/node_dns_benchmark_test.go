@@ -3,7 +3,6 @@ package outbound
 import (
 	"bytes"
 	"encoding/base64"
-	"runtime"
 	"testing"
 
 	C "github.com/metacubex/mihomo/constant"
@@ -58,40 +57,6 @@ func BenchmarkUnusedNodeDNS(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
-		})
-	}
-}
-
-func TestUnusedNodeDNSRetainedHeap(t *testing.T) {
-	servers := []string{"192.0.2.53"}
-	for _, factory := range nodeDNSFactories(t) {
-		t.Run(factory.name, func(t *testing.T) {
-			warm, err := factory.new(servers)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_ = warm.Close()
-			nodes := make([]C.ProxyAdapter, 2048)
-			t.Cleanup(func() {
-				for _, node := range nodes {
-					if node != nil {
-						_ = node.Close()
-					}
-				}
-			})
-			runtime.GC()
-			var before, after runtime.MemStats
-			runtime.ReadMemStats(&before)
-			for i := range nodes {
-				nodes[i], err = factory.new(servers)
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-			runtime.GC()
-			runtime.ReadMemStats(&after)
-			t.Logf("%d unused nodes: %+d retained bytes, %+d objects", len(nodes), int64(after.HeapAlloc)-int64(before.HeapAlloc), int64(after.HeapObjects)-int64(before.HeapObjects))
-			runtime.KeepAlive(nodes)
 		})
 	}
 }
