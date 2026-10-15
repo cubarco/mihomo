@@ -78,9 +78,16 @@ func (p *Pool) GetContext(ctx context.Context) (net.Conn, error) {
 
 // Dial opens a connection for one request without taking an idle one.
 func (p *Pool) Dial(ctx context.Context) (*PoolConn, error) {
+	if p.closed.Load() {
+		return nil, pool.ErrClosed
+	}
 	conn, err := p.factory(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if p.closed.Load() {
+		_ = conn.Close()
+		return nil, pool.ErrClosed
 	}
 	return &PoolConn{Snell: conn, pool: p, uses: 1}, nil
 }

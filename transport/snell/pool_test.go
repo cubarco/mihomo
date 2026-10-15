@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	CP "github.com/metacubex/mihomo/component/pool"
 	"github.com/metacubex/mihomo/transport/shadowsocks/shadowaead"
 )
 
@@ -326,5 +327,48 @@ func TestRepooledConnectionStartsANewIdleAge(t *testing.T) {
 	case <-closed:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the connection parked again was never closed")
+	}
+}
+
+func TestPoolDialRejectsClosedPool(t *testing.T) {
+	called := false
+	p := NewPool(func(context.Context) (*Snell, error) {
+		called = true
+		return &Snell{Conn: &recordingConn{}}, nil
+	})
+	_ = p.Close()
+	conn, err := p.Dial(context.Background())
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if !errors.Is(err, CP.ErrClosed) || called {
+		t.Fatalf("closed pool dial: error=%v, factory called=%v", err, called)
+	}
+}
+
+func TestPoolDialDiscardsConnectionWhenClosedDuringDial(t *testing.T) {
+	raw := &recordingConn{}
+	started, resume := make(chan struct{}), make(chan struct{})
+	p := NewPool(func(context.Context) (*Snell, error) {
+		close(started)
+		<-resume
+		return &Snell{Conn: raw}, nil
+	})
+	result := make(chan error, 1)
+	go func() {
+		conn, err := p.Dial(context.Background())
+		if conn != nil {
+			_ = conn.Close()
+		}
+		result <- err
+	}()
+	<-started
+	_ = p.Close()
+	close(resume)
+	if err := <-result; !errors.Is(err, CP.ErrClosed) {
+		t.Fatalf("dial published a connection after pool close: %v", err)
+	}
+	if !raw.closed {
+		t.Fatal("late connection was not closed")
 	}
 }
