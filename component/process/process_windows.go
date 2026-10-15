@@ -61,7 +61,7 @@ func initWin32API() error {
 	return nil
 }
 
-func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string, error) {
+func findProcessName(network string, ip netip.Addr, srcPort int, inspect processInspector) (uint32, string, error) {
 	once.Do(func() {
 		err := initWin32API()
 		if err != nil {
@@ -100,6 +100,9 @@ func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string
 		return 0, "", err
 	}
 	pp, err := getExecPathFromPID(pid)
+	if err == nil && inspect != nil {
+		inspect(pid, pp)
+	}
 	return 0, pp, err
 }
 
@@ -113,40 +116,35 @@ type searcher struct {
 }
 
 func (s *searcher) Search(b []byte, ip netip.Addr, port uint16) (uint32, error) {
+	if len(b) < 4 {
+		return 0, ErrNotFound
+	}
 	n := int(readNativeUint32(b[:4]))
 	itemSize := s.itemSize
-	for i := 0; i < n; i++ {
-		row := b[4+itemSize*i : 4+itemSize*(i+1)]
-
-		if s.tcpState >= 0 {
-			tcpState := readNativeUint32(row[s.tcpState : s.tcpState+4])
-			// MIB_TCP_STATE_ESTAB, only check established connections for TCP
-			if tcpState != 5 {
+	if n > (len(b)-4)/itemSize {
+		return 0, ErrNotFound
+	}
+	network := UDP
+	if s.tcpState >= 0 {
+		network = TCP
+	}
+	selected, err := selectSocketOwner(network, ip, port, func(yield func(socketOwner) bool) {
+		for i := 0; i < n; i++ {
+			row := b[4+itemSize*i : 4+itemSize*(i+1)]
+			if s.tcpState >= 0 && readNativeUint32(row[s.tcpState:s.tcpState+4]) != 5 {
 				continue
 			}
+			srcPort := syscall.Ntohs(uint16(readNativeUint32(row[s.port : s.port+4])))
+			if srcPort != port {
+				continue
+			}
+			srcIP, _ := netip.AddrFromSlice(row[s.ip : s.ip+s.ipSize])
+			if !yield(socketOwner{address: srcIP, port: srcPort, pid: readNativeUint32(row[s.pid : s.pid+4])}) {
+				return
+			}
 		}
-
-		// according to MSDN, only the lower 16 bits of dwLocalPort are used and the port number is in network endian.
-		// this field can be illustrated as follows depends on different machine endianess:
-		//     little endian: [ MSB LSB  0   0  ]   interpret as native uint32 is ((LSB<<8)|MSB)
-		//       big  endian: [  0   0  MSB LSB ]   interpret as native uint32 is ((MSB<<8)|LSB)
-		// so we need an syscall.Ntohs on the lower 16 bits after read the port as native uint32
-		srcPort := syscall.Ntohs(uint16(readNativeUint32(row[s.port : s.port+4])))
-		if srcPort != port {
-			continue
-		}
-
-		srcIP, _ := netip.AddrFromSlice(row[s.ip : s.ip+s.ipSize])
-		srcIP = srcIP.Unmap()
-		// windows binds an unbound udp socket to 0.0.0.0/[::] while first sendto
-		if ip != srcIP && (!srcIP.IsUnspecified() || s.tcpState != -1) {
-			continue
-		}
-
-		pid := readNativeUint32(row[s.pid : s.pid+4])
-		return pid, nil
-	}
-	return 0, ErrNotFound
+	})
+	return selected.pid, err
 }
 
 func newSearcher(isV4, isTCP bool) *searcher {

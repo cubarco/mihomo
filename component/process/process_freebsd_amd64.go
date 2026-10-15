@@ -20,7 +20,7 @@ var (
 	once sync.Once
 )
 
-func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string, error) {
+func findProcessName(network string, ip netip.Addr, srcPort int, inspect processInspector) (uint32, string, error) {
 	once.Do(func() {
 		if err := initSearcher(); err != nil {
 			log.Errorln("Initialize PROCESS-NAME failed: %s", err.Error())
@@ -56,6 +56,9 @@ func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string
 	}
 
 	pp, err := getExecPathFromPID(pid)
+	if err == nil && inspect != nil {
+		inspect(pid, pp)
+	}
 	return 0, pp, err
 }
 

@@ -62,7 +62,7 @@ type inetDiagResponse struct {
 	INode   uint32
 }
 
-func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string, error) {
+func findProcessName(network string, ip netip.Addr, srcPort int, inspect processInspector) (uint32, string, error) {
 	uid, inode, err := resolveSocketByNetlink(network, ip, srcPort)
 	if runtime.GOOS == "android" {
 		// on Android (especially recent releases), netlink INET_DIAG can fail or return UID 0 / empty process info for some apps
@@ -79,7 +79,7 @@ func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string
 	if err != nil {
 		return 0, "", err
 	}
-	pp, err := resolveProcessNameByProcSearch(inode, uid)
+	pp, err := resolveProcessNameByProcSearch(inode, uid, inspect)
 	if runtime.GOOS == "android" {
 		// if inode-based /proc/<pid>/fd resolution fails but UID is known,
 		// fall back to resolving the process/package name by UID (typical on Android where all app processes share one UID).
@@ -133,48 +133,37 @@ func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uid uin
 		return 0, 0, err
 	}
 
-	err = ErrNotFound
-	for _, msg := range messages {
-		if len(msg.Data) < inetDiagResponseSize {
-			continue
+	selected, err := selectSocketOwner(network, ip, uint16(srcPort), func(yield func(socketOwner) bool) {
+		for _, msg := range messages {
+			if len(msg.Data) < inetDiagResponseSize {
+				continue
+			}
+			response := (*inetDiagResponse)(unsafe.Pointer(&msg.Data[0]))
+			var src netip.Addr
+			switch response.Family {
+			case unix.AF_INET:
+				var a [4]byte
+				copy(a[:], response.Src[:4])
+				src = netip.AddrFrom4(a)
+			case unix.AF_INET6:
+				src = netip.AddrFrom16(response.Src).Unmap()
+			default:
+				continue
+			}
+			if !yield(socketOwner{
+				address: src,
+				port:    binary.BigEndian.Uint16(response.SrcPort[:]),
+				uid:     response.UID,
+				inode:   response.INode,
+			}) {
+				return
+			}
 		}
-
-		response := (*inetDiagResponse)(unsafe.Pointer(&msg.Data[0]))
-
-		// always set to allow fallback when check fails
-		uid, inode, err = response.UID, response.INode, nil
-
-		// check src port
-		if binary.BigEndian.Uint16(response.SrcPort[:]) != uint16(srcPort) {
-			continue
-		}
-
-		// check src IP
-		var src netip.Addr
-		switch response.Family {
-		case unix.AF_INET:
-			var a [4]byte
-			copy(a[:], response.Src[:4])
-			src = netip.AddrFrom4(a)
-		case unix.AF_INET6:
-			var a [16]byte
-			copy(a[:], response.Src[:])
-			src = netip.AddrFrom16(a).Unmap()
-		default:
-			continue
-		}
-		if src != ip.Unmap() {
-			continue
-		}
-
-		// this is the one we want
-		break
-	}
-
-	return
+	})
+	return selected.uid, selected.inode, err
 }
 
-func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
+func resolveProcessNameByProcSearch(inode, uid uint32, inspect processInspector) (string, error) {
 	files, err := os.ReadDir("/proc")
 	if err != nil {
 		return "", err
@@ -190,7 +179,7 @@ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
 
 		info, err := f.Info()
 		if err != nil {
-			return "", err
+			continue
 		}
 		if info.Sys().(*syscall.Stat_t).Uid != uid {
 			continue
@@ -221,7 +210,14 @@ func resolveProcessNameByProcSearch(inode, uid uint32) (string, error) {
 				}
 			} else {
 				if bytes.Equal(buffer[:n], socket) {
-					return os.Readlink(filepath.Join(processPath, "exe"))
+					exe, err := os.Readlink(filepath.Join(processPath, "exe"))
+					if err == nil && inspect != nil {
+						pid, parseErr := strconv.ParseUint(f.Name(), 10, 32)
+						if parseErr == nil {
+							inspect(uint32(pid), exe)
+						}
+					}
+					return exe, err
 				}
 			}
 		}

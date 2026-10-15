@@ -319,17 +319,42 @@ func preHandleMetadata(metadata *C.Metadata) error {
 	return nil
 }
 
-func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
-	if metadata.SpecialProxy != "" {
-		var exist bool
-		proxy, exist = proxies[metadata.SpecialProxy]
-		if !exist {
-			err = fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
+func lookupProcess(metadata *C.Metadata) string {
+	if !features.Android {
+		// normal check for process
+		info, err := process.FindProcessInfo(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
+		if err != nil {
+			log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
+		} else {
+			metadata.Process = filepath.Base(info.Path)
+			metadata.ProcessPath = info.Path
+			metadata.Uid = info.UID
+
+			if pkg, err := process.FindPackageName(metadata); err == nil { // for android (not CMFA) package names
+				metadata.Process = pkg
+			}
+			return interpretedBittorrentClient(info.Path, info.Arguments, runtime.GOOS)
 		}
-		return
+	} else {
+		// check package names
+		pkg, err := process.FindPackageName(metadata)
+		if err != nil {
+			log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
+		} else {
+			metadata.Process = pkg
+		}
 	}
+	return ""
+}
+
+func resolveMetadata(metadata *C.Metadata) (C.Proxy, C.Rule, error) {
+	return resolveMetadataWithProcess(metadata, lookupProcess, runtime.GOOS)
+}
+
+func resolveMetadataWithProcess(metadata *C.Metadata, findProcess func(*C.Metadata) string, goos string) (proxy C.Proxy, rule C.Rule, err error) {
 	var (
 		resolved             bool
+		processClient        string
 		attemptProcessLookup = metadata.Type != C.INNER
 	)
 
@@ -356,29 +381,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		FindProcess: func() {
 			if attemptProcessLookup {
 				attemptProcessLookup = false
-				if !features.Android {
-					// normal check for process
-					uid, path, err := process.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
-					if err != nil {
-						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
-					} else {
-						metadata.Process = filepath.Base(path)
-						metadata.ProcessPath = path
-						metadata.Uid = uid
-
-						if pkg, err := process.FindPackageName(metadata); err == nil { // for android (not CMFA) package names
-							metadata.Process = pkg
-						}
-					}
-				} else {
-					// check package names
-					pkg, err := process.FindPackageName(metadata)
-					if err != nil {
-						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
-					} else {
-						metadata.Process = pkg
-					}
-				}
+				processClient = findProcess(metadata)
 			}
 		},
 		CheckPassRule: func(adapterName string) bool {
@@ -393,6 +396,30 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 			}
 			return false
 		},
+	}
+
+	if canForceProcessDirect(metadata, goos) {
+		originalProcess, originalPath, originalUID := metadata.Process, metadata.ProcessPath, metadata.Uid
+		helper.FindProcess()
+		processName := strings.ToLower(metadata.Process)
+		if processClient != "" {
+			processName = processClient
+		}
+		if directRule := bittorrentDirectRules[processName]; directRule != nil {
+			return proxies["DIRECT"], directRule, nil
+		}
+		if FindProcessMode() == process.FindProcessOff {
+			metadata.Process, metadata.ProcessPath, metadata.Uid = originalProcess, originalPath, originalUID
+		}
+	}
+
+	if metadata.SpecialProxy != "" {
+		var exist bool
+		proxy, exist = proxies[metadata.SpecialProxy]
+		if !exist {
+			err = fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
+		}
+		return
 	}
 
 	switch FindProcessMode() {
