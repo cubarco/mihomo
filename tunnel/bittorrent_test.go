@@ -258,10 +258,3 @@ func TestBittorrentDirectPlatformScope(t *testing.T) {
 		})
 	}
 }
-
-func BenchmarkScanDownloadClients(b *testing.B) {
-	b.ReportAllocs()
-	for b.Loop() {
-		scanDownloadClients()
-	}
-}
