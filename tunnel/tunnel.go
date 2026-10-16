@@ -398,7 +398,7 @@ func resolveMetadataWithProcess(metadata *C.Metadata, findProcess func(*C.Metada
 		},
 	}
 
-	if canForceProcessDirect(metadata, goos) {
+	if canForceProcessDirect(metadata, goos) && downloadClients.needsLookup(metadata) {
 		originalProcess, originalPath, originalUID := metadata.Process, metadata.ProcessPath, metadata.Uid
 		helper.FindProcess()
 		processName := strings.ToLower(metadata.Process)
@@ -406,6 +406,7 @@ func resolveMetadataWithProcess(metadata *C.Metadata, findProcess func(*C.Metada
 			processName = processClient
 		}
 		if directRule := bittorrentDirectRules[processName]; directRule != nil {
+			downloadClients.seen()
 			return proxies["DIRECT"], directRule, nil
 		}
 		if FindProcessMode() == process.FindProcessOff {

@@ -7,6 +7,16 @@ Windows、macOS 和 Linux 的 FlClash 内核在选择全局代理、匹配订阅
 “查找进程”开关仍控制其他应用的进程规则和显示，BT 客户端的识别独立执行
 Android 和其他平台不启用此策略
 
+## 按需识别
+
+查询连接归属需要扫描整张系统 socket 表，因此只在可能命中下载客户端时执行：
+
+- 目标不是 TCP 80/443 或 UDP 443 的本机连接照常逐个识别；Peer、DHT、UDP Tracker 和非标准端口 Tracker 都属于这一类，客户端的第一条此类连接即被识别并直连
+- 网页端口连接（TCP 80/443、UDP 443）只在以下任一条件成立时才识别：最近 60 秒内有连接被识别为下载客户端；或按需扫描进程列表发现下载客户端正在运行
+- 进程列表扫描不使用后台定时器，只在出现网页端口连接且近期未识别到客户端时触发，最多每 3 秒一次；扫描复用下方的名称与入口识别，只为 Java / Python 候选读取参数
+- 无法读取进程列表时视为有客户端运行，网页端口连接也逐个识别，与按需识别前一致
+- 代价：客户端启动后、下一次扫描之前（最多 3 秒），若尚未产生非网页端口连接，其 HTTP(S) Tracker 请求可能仍按原策略路由
+
 ## 客户端识别
 
 桌面端按可执行文件名精确匹配，忽略大小写，并支持 `.exe` 后缀：
@@ -50,6 +60,7 @@ Python / Java 自身不会整体直连，普通应用的参数、目录名或 Ja
 - 仅适用于当前设备上可查询到归属的连接；局域网其他设备、隔离容器、改名客户端、未知启动方式或权限不足可能无法识别，未识别连接仍按原策略路由
 - 内核自身的订阅下载、DNS 和节点探测连接不参与客户端识别
 - 对新建连接生效，已有 TCP 连接和 UDP 会话需要重建
+- 按需识别的时间窗口见上文“按需识别”
 - 客户端自行指定远程代理时，本策略不能去除客户端自身的代理协议或配置
 - 现有“BT 下载直连”预设仍可用于规则模式下的 Tracker / PT 域名匹配
 
@@ -82,6 +93,9 @@ Apple M4 / macOS arm64，`GOMAXPROCS=8`，64 个工作 goroutine，单项测量 
 模拟表扫描包含地址、端口和归属歧义判断，不包含系统调用生成 socket 表的成本
 参数基准读取的是自有测试进程，参数长度会影响耗时与分配
 
+按需识别的进程列表扫描（Apple M4 / macOS arm64，本机 566 个进程，`BenchmarkScanDownloadClients`）：每次 1.0–1.6 ms、约 515 KB 分配；最多每 3 秒一次，只在出现网页端口连接且近期未识别到客户端时执行
+没有下载客户端运行时，网页端口连接不再查询 socket 表
+
 当前权限下原生 TCP 表只返回 48 字节头尾数据，完整原生 socket 查询基准已显式跳过，空表数据不计入性能结论
 以上结果证明新增分类和参数读取的局部开销，不能替代管理员权限下的完整连接查找、端到端吞吐或三平台实机压测
 
@@ -107,5 +121,5 @@ sandbox-exec -f "$bench_dir/bench.sb" "$bench_dir/process.test" -test.run='^$' -
 sandbox-exec -f "$bench_dir/bench.sb" "$bench_dir/tunnel.test" -test.run='^$' -test.bench=BenchmarkBittorrentRuntime -test.benchmem -test.benchtime=1s -test.count=3 -test.cpu=8 -test.v
 ```
 
-主要实现位于 `tunnel/bittorrent.go`、`tunnel/bittorrent_runtime.go`、`tunnel/tunnel.go` 和 `component/process/`
+主要实现位于 `tunnel/bittorrent.go`、`tunnel/bittorrent_gate.go`、`tunnel/bittorrent_runtime.go`、`tunnel/tunnel.go` 和 `component/process/`
 CI 的 Go 基础检查已包含 `component/process` 和 `tunnel` 回归测试
