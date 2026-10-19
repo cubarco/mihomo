@@ -80,11 +80,12 @@ func (r *Resolver) traceCacheHit(ctx context.Context, q D.Question, msg *D.Msg) 
 }
 
 type exchangeTrace struct {
-	notify    QueryNotify
-	resolver  *Resolver
-	question  D.Question
-	initiator string
-	start     time.Time
+	notify     QueryNotify
+	resolver   *Resolver
+	question   D.Question
+	initiator  string
+	start      time.Time
+	generation uint64
 
 	mu        sync.Mutex
 	upstreams map[*D.Msg]string
@@ -92,18 +93,19 @@ type exchangeTrace struct {
 
 type exchangeTraceKey struct{}
 
-func (r *Resolver) traceExchange(ctx context.Context, q D.Question, initiator string) (context.Context, *exchangeTrace) {
+func (r *Resolver) traceExchange(ctx context.Context, q D.Question, initiator string, generation uint64) (context.Context, *exchangeTrace) {
 	notify := getQueryNotify()
 	if notify == nil {
 		return ctx, nil
 	}
 	trace := &exchangeTrace{
-		notify:    notify,
-		resolver:  r,
-		question:  q,
-		initiator: initiator,
-		start:     time.Now(),
-		upstreams: map[*D.Msg]string{},
+		notify:     notify,
+		resolver:   r,
+		question:   q,
+		initiator:  initiator,
+		start:      time.Now(),
+		generation: generation,
+		upstreams:  map[*D.Msg]string{},
 	}
 	return context.WithValue(ctx, exchangeTraceKey{}, trace), trace
 }
@@ -134,7 +136,11 @@ func (t *exchangeTrace) finish(msg *D.Msg, err error) {
 		record.Upstream = t.upstreams[msg]
 		t.mu.Unlock()
 		if record.Upstream != "" {
-			answeredBy.Set(answeredByKey(t.resolver, t.question), record.Upstream)
+			t.resolver.stateMu.RLock()
+			if t.resolver.generation == t.generation {
+				answeredBy.Set(answeredByKey(t.resolver, t.question), record.Upstream)
+			}
+			t.resolver.stateMu.RUnlock()
 		}
 	}
 	t.notify(record)

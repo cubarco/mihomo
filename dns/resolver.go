@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
-	"reflect"
+	"strconv"
 	"sync"
 	"time"
 
@@ -48,6 +48,8 @@ type Resolver struct {
 	fallbackLazyQuery     bool
 	group                 singleflight.Group[*D.Msg]
 	cache                 dnsCache
+	stateMu               sync.RWMutex
+	generation            uint64
 	policy                []dnsPolicy
 	defaultResolver       *Resolver
 	queryOnce             sync.Once
@@ -190,6 +192,11 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 	}
 	q := m.Question[0]
 	m = m.Copy()
+	r.stateMu.RLock()
+	generation := r.generation
+	r.stateMu.RUnlock()
+	// An exchange started before ClearAll must not be shared with the new network state.
+	key := strconv.FormatUint(generation, 10) + " " + q.String()
 
 	retryNum := 0
 	retryMax := 3
@@ -197,7 +204,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 	fn := func() (result *D.Msg, err error) {
 		ctx, cancel := context.WithTimeout(parent, resolver.DefaultDNSTimeout)
 		defer cancel()
-		ctx, trace := r.traceExchange(ctx, q, initiator)
+		ctx, trace := r.traceExchange(ctx, q, initiator, generation)
 		cache := false
 
 		defer func() {
@@ -209,7 +216,11 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 			}
 
 			if cache {
-				putMsgToCache(r.cache, q, result)
+				r.stateMu.RLock()
+				if r.generation == generation {
+					putMsgToCache(r.cache, q, result)
+				}
+				r.stateMu.RUnlock()
 			}
 		}()
 
@@ -232,7 +243,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 		return
 	}
 
-	ch := r.group.DoChan(q.String(), fn)
+	ch := r.group.DoChan(key, fn)
 
 	var result singleflight.Result[*D.Msg]
 
@@ -248,7 +259,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 				result := <-ch
 				ret, err, shared := result.Val, result.Err, result.Shared
 				if err != nil && !shared && ret.Opcode < retryMax && parent.Err() == nil { // retry
-					r.group.DoChan(q.String(), fn)
+					r.group.DoChan(key, fn)
 				}
 			}()
 			return nil, ctx.Err()
@@ -257,7 +268,7 @@ func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.M
 
 	ret, err, shared := result.Val, result.Err, result.Shared
 	if err != nil && !shared && ret.Opcode < retryMax && parent.Err() == nil { // retry
-		r.group.DoChan(q.String(), fn)
+		r.group.DoChan(key, fn)
 	}
 
 	if err == nil {
@@ -416,28 +427,7 @@ func (r *Resolver) resetConnections(seen map[dnsClient]struct{}) {
 	if r == nil {
 		return
 	}
-	resetOnce := func(c dnsClient) {
-		raw := rawTransport(c)
-		if raw == nil {
-			return
-		}
-		if reflect.ValueOf(raw).Comparable() {
-			if _, done := seen[raw]; done {
-				return
-			}
-			seen[raw] = struct{}{}
-		}
-		raw.ResetConnection()
-	}
-	for _, c := range r.main {
-		resetOnce(c)
-	}
-	for _, c := range r.fallback {
-		resetOnce(c)
-	}
-	for _, policy := range r.policy {
-		policy.forEachClient(resetOnce)
-	}
+	r.forEachClient(func(c dnsClient) { resetClientOnce(c, seen, false) })
 	r.defaultResolver.resetConnections(seen)
 }
 
