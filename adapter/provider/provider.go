@@ -45,11 +45,12 @@ type providerForApi struct {
 }
 
 type baseProvider struct {
-	mutex       sync.RWMutex
-	name        string
-	proxies     []C.Proxy
-	healthCheck *HealthCheck
-	version     uint32
+	mappingSchema *proxyProviderSchema
+	mutex         sync.RWMutex
+	name          string
+	proxies       []C.Proxy
+	healthCheck   *HealthCheck
+	version       uint32
 }
 
 func (bp *baseProvider) Name() string {

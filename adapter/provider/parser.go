@@ -93,12 +93,20 @@ func ParseProxyProvider(name string, mapping map[string]any, tunnel C.Tunnel) (P
 		}
 		vehicle = resource.NewHTTPVehicle(schema.URL, path, schema.Proxy, schema.Header, resource.DefaultHttpTimeout, schema.SizeLimit)
 	case "inline":
-		return NewInlineProvider(name, schema.Payload, parser, hc)
+		pd, err := NewInlineProvider(name, schema.Payload, parser, hc)
+		if err == nil {
+			pd.mappingSchema = schema
+		}
+		return pd, err
 	default:
 		return nil, fmt.Errorf("%w: %s", errVehicleType, schema.Type)
 	}
 
 	interval := time.Duration(uint(schema.Interval)) * time.Second
 
-	return NewProxySetProvider(name, interval, schema.Payload, parser, vehicle, hc)
+	pd, err := NewProxySetProvider(name, interval, schema.Payload, parser, vehicle, hc)
+	if err == nil {
+		pd.mappingSchema = schema
+	}
+	return pd, err
 }

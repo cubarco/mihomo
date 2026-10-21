@@ -2,6 +2,7 @@ package resource
 
 import (
 	"context"
+	"errors"
 	"io"
 	"io/fs"
 	"os"
@@ -241,6 +242,38 @@ func (f *Fetcher[V]) loadBufLocked(buf []byte, hash utils.HashType, updateFile b
 
 	published = true
 	return contents, false, nil
+}
+
+// ReadSnapshot only returns bytes that produced the currently published value.
+func (f *Fetcher[V]) ReadSnapshot(maxBytes int64) ([]byte, error) {
+	f.loadBufMutex.Lock()
+	defer f.loadBufMutex.Unlock()
+	if err := f.ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !f.hash.IsValid() {
+		return nil, nil
+	}
+	file, err := os.Open(f.vehicle.Path())
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || maxBytes <= 0 || info.Size() > maxBytes {
+		return nil, errors.New("provider snapshot exceeds read limit")
+	}
+	buf, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(buf)) > maxBytes || !utils.MakeHash(buf).Equal(f.hash) {
+		return nil, errors.New("provider snapshot changed")
+	}
+	return buf, nil
 }
 
 func (f *Fetcher[V]) Close() error {
