@@ -1,6 +1,6 @@
 # Local mipstack low-memory policy
 
-Source: github.com/metacubex/mipstack v0.0.0-20260930071539-961d4b1c1983, copied from the Go module cache with its MPL-2.0 license, sources and tests retained. Both the mihomo module and FlClash core replace this dependency with this directory.
+Source: github.com/metacubex/mipstack v0.0.0-20261019124225-9a80a07eaeb9, copied from the Go module cache with its MPL-2.0 license, sources and tests retained. Both the mihomo module and FlClash core replace this dependency with this directory.
 
 Backport: https://github.com/MetaCubeX/mipstack/pull/3 at commit `456a89053ab2a5b08cc9e90be294871f2505027a`. The source baseline is newer than the PR; the benchmark helper preserves its newer MTU argument. Production changes otherwise match the upstream storage policy.
 
@@ -25,3 +25,5 @@ The deterministic profile counts retained backing, not Android RSS. Upstream's i
 Updated to 961d4b1c1983 for packet batch input, RX checksum offload, ICMPv6 and TCP correctness fixes. The storage policy remains a local patch; the benchmark helper also keeps the newer IPv6/offload parameters.
 
 `ValidateConfig` in config.go is a local addition that exposes the configuration checks of `New`; the mihomo MASQUE outbound uses it to decide whether to build its IP stack at load time. Keep it when updating the source.
+
+Updated to 9a80a07eaeb9 for TCP close-write, PAWS, keepalive, recovery and congestion accounting, UDP ancillary I/O, and fragment/ICMP fixes. The upstream regression cases are retained together with the local low-memory and ValidateConfig additions.

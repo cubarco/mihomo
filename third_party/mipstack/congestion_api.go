@@ -261,8 +261,9 @@ type CongestionEventType uint8
 const (
 	// CongestionEventUnknown is never sent by TCP.
 	CongestionEventUnknown CongestionEventType = iota
-	// CongestionEventInitialize seeds a newly established controller and
-	// permits updates to its initial cwnd, ssthresh, and pacing-rate policy.
+	// CongestionEventInitialize seeds a new controller from the connection's
+	// current transport state, including its phase when replacing an existing
+	// controller. It permits updates to cwnd, ssthresh, and pacing-rate policy.
 	CongestionEventInitialize
 	// CongestionEventACK reports newly delivered data and permits updates to
 	// cwnd, ssthresh, and the common pacing-rate policy.
@@ -303,8 +304,10 @@ const (
 	// without changing transport state.
 	CongestionEventDiagnostics
 	// CongestionEventPacketLost reports one transmission generation newly
-	// proven lost by SACK, RACK, or an RTO. PacketBytes and PacketState describe
-	// that generation. State is observational.
+	// accounted as lost by SACK, RACK, or an RTO. PacketBytes and PacketState
+	// describe that generation; PacketLossEvidenceValid is false when loss
+	// attribution for its saved state is unavailable or was invalidated,
+	// including SACK reneging. State is observational.
 	CongestionEventPacketLost
 	// CongestionEventTailLossProbeRecovered corresponds to Linux
 	// CA_EVENT_TLP_RECOVERY: a retransmitted tail-loss probe repaired genuine
@@ -350,7 +353,9 @@ type CongestionState struct {
 	CongestionWindow uint32
 	// SlowStartThreshold is ssthresh in bytes.
 	SlowStartThreshold uint32
-	// BytesInFlight is the transport's current congestion flight in bytes.
+	// BytesInFlight is the transport's congestion flight estimate in bytes.
+	// PacketSent and PacketRetransmitted events precede any new flight
+	// contribution from the reported transmission.
 	BytesInFlight uint32
 	// MaximumSegmentSize is the current sender MSS in bytes.
 	MaximumSegmentSize int
@@ -512,7 +517,8 @@ type CongestionEvent struct {
 	PacketBytes int
 	// PacketState is controller-owned per-generation state. It is writable only
 	// during packet transmission events and read-only during packet-loss and
-	// tail-loss-probe events.
+	// tail-loss-probe events. PacketLossEvidenceValid qualifies its use for
+	// packet-loss attribution.
 	PacketState uint64
 	// OutstandingBytes is sequence-space still outstanding before a packet event.
 	OutstandingBytes uint32
@@ -522,6 +528,12 @@ type CongestionEvent struct {
 	PreviousPhase CongestionPhase
 	// MarkApplicationLimited asks TCP to mark the current delivery interval.
 	MarkApplicationLimited bool
+	// PacketLossEvidenceValid qualifies PacketState for loss attribution on
+	// CongestionEventPacketLost. It is false when the selected generation's
+	// delivery snapshot was consumed or its loss attribution was otherwise
+	// invalidated, including recovery after SACK reneging. PacketState remains
+	// available for other controller uses regardless of this flag.
+	PacketLossEvidenceValid bool
 	// Recovery is valid for CongestionEventRecovery.
 	Recovery CongestionRecovery
 	// Pacing is valid for CongestionEventPacing.
