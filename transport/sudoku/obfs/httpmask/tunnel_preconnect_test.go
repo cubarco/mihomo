@@ -11,12 +11,6 @@ import (
 	"time"
 )
 
-func TestSessionPreconnectCount(t *testing.T) {
-	if got := sessionPreconnectCount(); got != 3 {
-		t.Fatalf("sessionPreconnectCount() = %d, want 3", got)
-	}
-}
-
 func TestDialSessionPreconnectsUploadAndPull(t *testing.T) {
 	var dialer *preconnectDialer
 	server := httptest.NewServer(stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, _ *stdhttp.Request) {

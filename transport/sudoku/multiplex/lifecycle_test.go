@@ -318,3 +318,40 @@ func TestSessionKeepaliveOnlyWhenIdleAndStops(t *testing.T) {
 		// synctest also waits for all session and peer goroutines to exit.
 	})
 }
+
+func TestSessionPendingWritesStayBounded(t *testing.T) {
+	left, peer := net.Pipe()
+	blocked := &blockedWriteConn{Conn: left, started: make(chan struct{})}
+	session, err := NewClientSession(blocked)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	defer session.Close()
+	var writers sync.WaitGroup
+	send := func() { defer writers.Done(); _ = session.sendFrame(frameData, 1, make([]byte, coalesceMaxPayload)) }
+	writers.Add(1)
+	go send()
+	<-blocked.started
+	for range 128 {
+		writers.Add(1)
+		go send()
+	}
+	queued := 0
+	for until := time.Now().Add(100 * time.Millisecond); time.Now().Before(until); {
+		session.pendMu.Lock()
+		if session.pending != nil {
+			queued = session.pending.Len()
+		}
+		session.pendMu.Unlock()
+		if queued > coalesceMaxPending {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	session.Close()
+	writers.Wait()
+	if queued > coalesceMaxPending {
+		t.Fatalf("blocked transport retained %d pending bytes, limit %d", queued, coalesceMaxPending)
+	}
+}

@@ -42,7 +42,8 @@ func TestPollPullSurvivesLongResponse(t *testing.T) {
 				})}
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
-				conn := &pollConn{
+				conn := &splitConn{
+					codec:      &splitPollCodec,
 					queuedConn: newQueuedConn(), readiness: newTunnelReadiness(),
 					ctx: ctx, cancel: cancel, client: client,
 					pullURL:    "http://fixture.invalid/stream?token=session",
