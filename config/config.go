@@ -275,6 +275,7 @@ type RawTun struct {
 	Enable              bool       `yaml:"enable" json:"enable"`
 	Device              string     `yaml:"device" json:"device"`
 	Stack               C.TUNStack `yaml:"stack" json:"stack"`
+	DNSMode             string     `yaml:"dns-mode" json:"dns-mode"`
 	DNSHijack           []string   `yaml:"dns-hijack" json:"dns-hijack"`
 	AutoRoute           bool       `yaml:"auto-route" json:"auto-route"`
 	AutoDetectInterface bool       `yaml:"auto-detect-interface" json:"auto-detect-interface"`
@@ -1681,6 +1682,9 @@ func parseIPV6(rawCfg *RawConfig) {
 }
 
 func parseTun(rawTun RawTun, dns *DNS, general *General) error {
+	if err := LC.ValidateTunDNSMode(rawTun.DNSMode); err != nil {
+		return err
+	}
 	tunAddressPrefix := dns.FakeIPRange
 	if !tunAddressPrefix.IsValid() {
 		tunAddressPrefix = netip.MustParsePrefix("198.18.0.1/16")
@@ -1691,6 +1695,7 @@ func parseTun(rawTun RawTun, dns *DNS, general *General) error {
 		Enable:              rawTun.Enable,
 		Device:              rawTun.Device,
 		Stack:               rawTun.Stack,
+		DNSMode:             rawTun.DNSMode,
 		DNSHijack:           rawTun.DNSHijack,
 		AutoRoute:           rawTun.AutoRoute,
 		AutoDetectInterface: rawTun.AutoDetectInterface,
