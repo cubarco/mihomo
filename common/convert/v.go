@@ -390,7 +390,7 @@ func buildRealmOpts(serverURL, token, realmID string, stunServers []string) map[
 	return opts
 }
 
-func splitHysteria2Ports(line string) (string, string) {
+func SplitHysteria2Ports(line string) (string, string) {
 	i := strings.Index(line, "://")
 	if i < 0 {
 		return line, ""
