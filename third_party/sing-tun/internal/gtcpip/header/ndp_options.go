@@ -698,7 +698,7 @@ func (o NDPRecursiveDNSServer) String() string {
 	if err != nil {
 		return fmt.Sprintf("%T([] valid for %s; err = %s)", o, lt, err)
 	}
-	return fmt.Sprintf("%T(%s valid for %s)", o, addrs, lt)
+	return fmt.Sprintf("%T(%v valid for %s)", o, addrs, lt)
 }
 
 // Lifetime returns the length of time that the DNS server addresses
@@ -747,7 +747,7 @@ func (o NDPRecursiveDNSServer) iterAddresses(fn func(tcpip.Address)) error {
 	for i := 0; len(o) != 0; i++ {
 		addr := tcpip.AddrFrom16Slice(o[:IPv6AddressSize])
 		if !IsV6UnicastAddress(addr) {
-			return fmt.Errorf("%d-th address (%s) in NDP Recursive DNS Server option is not a valid unicast IPv6 address: %w", i, addr, ErrNDPOptMalformedBody)
+			return fmt.Errorf("%d-th address (%v) in NDP Recursive DNS Server option is not a valid unicast IPv6 address: %w", i, addr, ErrNDPOptMalformedBody)
 		}
 
 		if fn != nil {

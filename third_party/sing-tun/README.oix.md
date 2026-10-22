@@ -14,3 +14,5 @@ go test -race -tags with_gvisor github.com/metacubex/sing-tun
 ```
 
 Updated to v0.4.27 for TUN packet batching, checksum offload, ICMP idle tracking and shutdown fixes. The empty stack selector retains the previous mixed/system/gVisor choice; upgrading the dependency does not change the application default.
+
+Backported ee69e4e0 and f9bc43e7: preserve disabled IPv4 UDP checksums, reject IPv6 zero checksums, normalize computed zero to 0xffff, and keep zero-checksum packets out of GRO even when redundant validation is skipped.
