@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/metacubex/mihomo/common/pool"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/sudoku"
 	"github.com/stretchr/testify/require"
@@ -178,11 +179,12 @@ func TestSudokuSharedDirectionalTablesUDPRoundTrip(t *testing.T) {
 				if session.Type != sudoku.SessionTypeUoT {
 					return fmt.Errorf("unexpected session type: %v", session.Type)
 				}
-				address, data, err := sudoku.ReadDatagram(session.Conn)
+				address, data, err := sudoku.NewUoTReader(session.Conn).ReadDatagram()
 				if err != nil {
 					return err
 				}
-				return sudoku.WriteDatagram(session.Conn, address, data)
+				defer pool.Put(data)
+				return sudoku.WriteDatagram(session.Conn, address.String(), data)
 			}()
 		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
