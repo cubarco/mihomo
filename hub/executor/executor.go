@@ -249,6 +249,10 @@ func updateNTP(c *config.NTP) {
 
 var dnsRetireAfter = time.AfterFunc
 
+// WrapProxyServerResolver wraps the proxy-server resolver as it is installed,
+// before providers start dialing nodes through it.
+var WrapProxyServerResolver func(resolver.Resolver) resolver.Resolver
+
 func installedResolvers() []resolver.Resolver {
 	return []resolver.Resolver{resolver.DefaultResolver, resolver.ProxyServerHostResolver, resolver.DirectHostResolver}
 }
@@ -315,6 +319,9 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 		resolver.ProxyServerHostResolver = r.ProxyResolver
 	} else {
 		resolver.ProxyServerHostResolver = r.Resolver
+	}
+	if WrapProxyServerResolver != nil {
+		resolver.ProxyServerHostResolver = WrapProxyServerResolver(resolver.ProxyServerHostResolver)
 	}
 
 	if r.DirectResolver.Invalid() {

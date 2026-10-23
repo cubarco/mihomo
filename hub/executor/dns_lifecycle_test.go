@@ -195,3 +195,16 @@ func TestShutdownKeepsFakeIPMappings(t *testing.T) {
 		t.Fatalf("restart reassigned kept.test from %s to %s", ip, again)
 	}
 }
+
+func TestDNSInstallWrapsProxyServerResolverBeforeProvidersLoad(t *testing.T) {
+	keepDNSGlobals(t)
+	previous := WrapProxyServerResolver
+	t.Cleanup(func() { WrapProxyServerResolver = previous })
+	type wrapped struct{ resolver.Resolver }
+	WrapProxyServerResolver = func(r resolver.Resolver) resolver.Resolver { return &wrapped{r} }
+	servers := []dns.NameServer{{Net: "rcode", Addr: "success"}}
+	updateDNS(&config.DNS{Enable: true, NameServer: servers, ProxyServerNameserver: servers}, true)
+	if _, ok := resolver.ProxyServerHostResolver.(*wrapped); !ok {
+		t.Fatalf("proxy-server resolver = %T, want the installed wrapper", resolver.ProxyServerHostResolver)
+	}
+}
