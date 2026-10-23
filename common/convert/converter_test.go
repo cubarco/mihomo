@@ -329,3 +329,27 @@ func TestConvertsV2RayVmessBase64HTTPRemappedToH2Transport(t *testing.T) {
 	_, err = adapter.ParseProxy(proxies[0])
 	assert.NoError(t, err)
 }
+
+func TestConvertsV2RayHTTPUpgradeUsesWebSocketOption(t *testing.T) {
+	vless := "vless://uuid@example.com:443?security=tls&type=httpupgrade&path=%2Fu&host=h.example&ed=2048#hu"
+	vmessJSON := `{"v":"2","ps":"hu","add":"example.com","port":"443","id":"b831381d-6324-4d53-ad4f-8cda48b30811","aid":"0","net":"httpupgrade","type":"none","host":"h.example","path":"/u?ed=2048","tls":"tls"}`
+	for _, link := range []string{vless, "vmess://" + base64.StdEncoding.EncodeToString([]byte(vmessJSON))} {
+		proxies, err := ConvertsV2Ray([]byte(link))
+		assert.Nil(t, err)
+		assert.Equal(t, "ws", proxies[0]["network"])
+		opts := proxies[0]["ws-opts"].(map[string]any)
+		assert.Equal(t, true, opts["v2ray-http-upgrade"])
+		assert.Equal(t, true, opts["v2ray-http-upgrade-fast-open"])
+		assert.Equal(t, "/u", opts["path"])
+
+		_, err = adapter.ParseProxy(proxies[0])
+		assert.NoError(t, err)
+	}
+}
+
+func TestConvertsV2RayVmessBase64EmptyALPN(t *testing.T) {
+	vmessJSON := `{"v":"2","ps":"n","add":"example.com","port":"443","id":"b831381d-6324-4d53-ad4f-8cda48b30811","aid":"0","net":"tcp","type":"none","tls":"tls","sni":"","alpn":"","fp":""}`
+	proxies, err := ConvertsV2Ray([]byte("vmess://" + base64.StdEncoding.EncodeToString([]byte(vmessJSON))))
+	assert.Nil(t, err)
+	assert.NotContains(t, proxies[0], "alpn")
+}

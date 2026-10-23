@@ -318,7 +318,7 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 				if strings.HasSuffix(tls, "tls") {
 					vmess["tls"] = true
 				}
-				if alpn, ok := values["alpn"].(string); ok {
+				if alpn, ok := values["alpn"].(string); ok && alpn != "" {
 					vmess["alpn"] = strings.Split(alpn, ",")
 				}
 			}
@@ -384,6 +384,10 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 				}
 				wsOpts["headers"] = headers
 				vmess["ws-opts"] = wsOpts
+				if network == "httpupgrade" {
+					vmess["network"] = "ws"
+					wsOpts["v2ray-http-upgrade"] = true
+				}
 
 			case "grpc":
 				grpcOpts := make(map[string]any)
