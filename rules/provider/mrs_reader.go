@@ -14,7 +14,10 @@ var MrsMagicBytes = [4]byte{'M', 'R', 'S', 1} // MRSv1
 
 func rulesMrsParse(buf []byte, strategy ruleStrategy) (ruleStrategy, error) {
 	if _strategy, ok := strategy.(mrsRuleStrategy); ok {
-		reader, err := zstd.NewReader(bytes.NewReader(buf))
+		reader, err := zstd.NewReader(bytes.NewReader(buf),
+			zstd.WithDecoderConcurrency(1),
+			zstd.WithDecoderLowmem(true),
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -57,8 +60,7 @@ func rulesMrsParse(buf []byte, strategy ruleStrategy) (ruleStrategy, error) {
 			return nil, errors.New("length is invalid")
 		}
 		if length > 0 {
-			extra := make([]byte, length)
-			_, err = io.ReadFull(reader, extra)
+			_, err = io.CopyN(io.Discard, reader, length)
 			if err != nil {
 				return nil, err
 			}

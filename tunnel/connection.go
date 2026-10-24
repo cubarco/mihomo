@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"time"
 
@@ -14,9 +15,10 @@ import (
 )
 
 type packetSender struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	ch     chan C.PacketAdapter
+	ctx        context.Context
+	cancel     context.CancelFunc
+	ch         chan C.PacketAdapter
+	diagnostic *udpSessionDiagnostic
 
 	// destination NAT mapping
 	originToTarget map[string]netip.Addr
@@ -26,13 +28,14 @@ type packetSender struct {
 
 // newPacketSender return a chan based C.PacketSender
 // It ensures that packets can be sent sequentially and without blocking
-func newPacketSender() C.PacketSender {
+func newPacketSender(diagnostic *udpSessionDiagnostic) C.PacketSender {
 	ctx, cancel := context.WithCancel(context.Background())
 	ch := make(chan C.PacketAdapter, senderCapacity)
 	return &packetSender{
-		ctx:    ctx,
-		cancel: cancel,
-		ch:     ch,
+		ctx:        ctx,
+		cancel:     cancel,
+		ch:         ch,
+		diagnostic: diagnostic,
 
 		originToTarget: make(map[string]netip.Addr),
 		targetToOrigin: make(map[netip.Addr]netip.Addr),
@@ -86,19 +89,23 @@ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
 			// TODO: ResolveUDP may take a long time to block the Process loop
 			//       but we want keep sequence sending so can't open a new goroutine
 			if err := pc.ResolveUDP(s.ctx, metadata); err != nil {
-				log.Warnln("[UDP] Resolve Ip error: %s", err)
+				s.diagnostic.sendFailed("resolve", err)
 				return
 			}
 		}
 
 		if !metadata.DstIP.IsValid() {
-			log.Warnln("[UDP] Destination ip not valid: %#v", metadata)
+			s.diagnostic.sendFailed("destination", os.ErrInvalid)
 			return
 		}
 		s.AddMapping(originMetadata, metadata)
 		addr = metadata.UDPAddr()
 	}
-	_ = handleUDPToRemote(packet, pc, addr)
+	if err := handleUDPToRemote(packet, pc, addr); err != nil {
+		s.diagnostic.sendFailed("write", err)
+	} else {
+		s.diagnostic.sent.Add(1)
+	}
 }
 
 func (s *packetSender) Process(pc C.PacketConn, proxy C.WriteBackProxy) {
@@ -141,6 +148,7 @@ func (s *packetSender) Send(packet C.PacketAdapter) {
 		packet.Drop() // sender closed when putting data to chan
 	default:
 		packet.Drop() // chan is full
+		s.diagnostic.sendFailed("enqueue", errUDPQueueFull)
 	}
 }
 
@@ -165,11 +173,14 @@ func handleUDPToRemote(packet C.UDPPacket, pc C.PacketConn, addr *net.UDPAddr) e
 	return nil
 }
 
-func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSender, key string, oAddrPort netip.AddrPort) {
+func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSender, key string, oAddrPort netip.AddrPort, diagnostic *udpSessionDiagnostic) {
+	stage := "read"
+	var endError error
 	defer func() {
 		sender.Close()
 		_ = pc.Close()
 		closeAllLocalCoon(key)
+		diagnostic.ended(stage, endError)
 		natTable.Delete(key)
 	}()
 
@@ -177,8 +188,10 @@ func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSen
 		_ = pc.SetReadDeadline(time.Now().Add(udpTimeout))
 		data, put, from, err := pc.WaitReadFrom()
 		if err != nil {
+			endError = err
 			return
 		}
+		diagnostic.received.Add(1)
 
 		fromUDPAddr, isUDPAddr := from.(*net.UDPAddr)
 		if !isUDPAddr {
@@ -202,6 +215,7 @@ func handleUDPToLocal(writeBack C.WriteBack, pc C.PacketConn, sender C.PacketSen
 			put()
 		}
 		if err != nil {
+			stage, endError = "write_back", err
 			return
 		}
 	}

@@ -208,36 +208,6 @@ func TestSnellV4WriterDefersSaltUntilFirstFrame(t *testing.T) {
 	}
 }
 
-func TestSnellV4IdentityFollowsSalt(t *testing.T) {
-	var raw bytes.Buffer
-	psk := []byte("password")
-	identity := IdentityHeaderFromPSK(psk)
-	writer, err := newV4WriterWithIdentity(&raw, psk, identity)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := writer.Write([]byte("x")); err != nil {
-		t.Fatal(err)
-	}
-
-	data := raw.Bytes()
-	headerStart := v4SaltSize
-	headerEnd := headerStart + len(identityWireMagic)
-	identityEnd := headerEnd + IdentityHeaderLength
-	if len(data) < identityEnd {
-		t.Fatalf("identity frame too short: %d", len(data))
-	}
-	if string(data[headerStart:headerEnd]) != identityWireMagic {
-		t.Fatalf("identity magic mismatch: %q", data[headerStart:headerEnd])
-	}
-	if !bytes.Equal(data[headerEnd:identityEnd], identity) {
-		t.Fatal("identity value mismatch")
-	}
-	if raw.Len() > v4FrameSize {
-		t.Fatalf("identity first frame exceeds MTU budget: %d", raw.Len())
-	}
-}
-
 func TestSnellV4PayloadLimitMatchesServer(t *testing.T) {
 	writer, err := newV4Writer(io.Discard, []byte("password"))
 	if err != nil {
@@ -263,16 +233,13 @@ func TestSnellV4PayloadLimitMatchesServer(t *testing.T) {
 }
 
 func TestSnellV4IdentityPayloadLimitIncludesHeader(t *testing.T) {
-	writer, err := newV4WriterWithIdentity(
-		io.Discard,
-		[]byte("password"),
-		IdentityHeaderFromPSK([]byte("password")),
-	)
+	writer, err := newV4Writer(io.Discard, []byte("password"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	writer.identityExporter = make([]byte, IdentityExporterLength)
 	want := uint16(
-		v4FrameSize - 55 - len(identityWireMagic) - IdentityHeaderLength -
+		v4FrameSize - 55 - len(identityWireMagicV2) - IdentityHeaderLength - IdentityAuthTagLength -
 			int(writer.initialPaddingLength),
 	)
 	if got := writer.nextPayloadLimit(); got != want {

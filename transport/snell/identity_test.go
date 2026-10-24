@@ -80,4 +80,7 @@ func TestSnellV4ExporterIdentityFollowsSalt(t *testing.T) {
 	if !bytes.Equal(wire[identityEnd:tagEnd], wantTag) {
 		t.Fatal("identity authentication tag mismatch")
 	}
+	if len(wire) > v4FrameSize {
+		t.Fatalf("identity first frame exceeds MTU budget: %d", len(wire))
+	}
 }

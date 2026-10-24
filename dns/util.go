@@ -113,7 +113,7 @@ func isIPRequest(q D.Question) bool {
 	return q.Qclass == D.ClassINET && (q.Qtype == D.TypeA || q.Qtype == D.TypeAAAA || q.Qtype == D.TypeCNAME)
 }
 
-func transform(servers []NameServer, resolver *Resolver) []dnsClient {
+func transform(servers []NameServer, resolver resolver.Resolver) []dnsClient {
 	ret := make([]dnsClient, 0, len(servers))
 	for _, s := range servers {
 		var c dnsClient
@@ -128,6 +128,8 @@ func transform(servers []NameServer, resolver *Resolver) []dnsClient {
 			c = newSystemClient()
 		case "tailscale":
 			c = newTailscaleClient(s.Addr)
+		case "easytier":
+			c = newEasyTierClient(s.Addr)
 		case "rcode":
 			c = newRCodeClient(s.Addr)
 		case "quic":
@@ -135,13 +137,36 @@ func transform(servers []NameServer, resolver *Resolver) []dnsClient {
 		default:
 			c = newClient(s.Addr, resolver, s.Net, s.Params, s.ProxyAdapter, s.ProxyName)
 		}
-
-		c = warpClientWithEdns0Subnet(c, s.Params)
-		c = warpClientWithDisableTypes(c, s.Params)
-
+		c = rewrapClient(c, s.Params)
 		ret = append(ret, c)
 	}
 	return ret
+}
+
+// rewrapClient peels any existing wrapper layers off c to reach the raw transport
+// client, then re-wraps it according to params. Passing a raw client is fine (the
+// peel is a no-op), which lets a shared raw transport be re-wrapped per name server.
+func rewrapClient(c dnsClient, params map[string]string) dnsClient {
+	c = rawTransport(c)
+	c = wrapClientWithEdns0Subnet(c, params)
+	c = wrapClientWithDisableTypes(c, params)
+	return c
+}
+
+func rawTransport(c dnsClient) dnsClient {
+	for {
+		u, ok := c.(interface{ Unwrap() dnsClient })
+		if !ok {
+			return c
+		}
+		c = u.Unwrap()
+	}
+}
+
+// isWrapperOnlyParam reports whether a param only affects the wrapper layer and not
+// the transport connection, so it can be ignored when comparing transports.
+func isWrapperOnlyParam(key string) bool {
+	return isDisableTypesParam(key) || isEdns0SubnetParam(key)
 }
 
 type clientWithDisableTypes struct {
@@ -181,7 +206,18 @@ func (c clientWithDisableTypes) inRR(rr D.RR) bool {
 	return ok
 }
 
-func warpClientWithDisableTypes(c dnsClient, params map[string]string) dnsClient {
+func (c clientWithDisableTypes) Unwrap() dnsClient { return c.dnsClient }
+
+// isDisableTypesParam reports the params consumed by wrapClientWithDisableTypes.
+func isDisableTypesParam(key string) bool {
+	switch key {
+	case "disable-ipv4", "disable-ipv6":
+		return true
+	}
+	return strings.HasPrefix(key, "disable-qtype-")
+}
+
+func wrapClientWithDisableTypes(c dnsClient, params map[string]string) dnsClient {
 	disableTypes := make(map[uint16]struct{})
 	if params["disable-ipv4"] == "true" {
 		disableTypes[D.TypeA] = struct{}{}
@@ -220,7 +256,18 @@ func (c clientWithEdns0Subnet) ExchangeContext(ctx context.Context, m *D.Msg) (*
 	return c.dnsClient.ExchangeContext(ctx, m)
 }
 
-func warpClientWithEdns0Subnet(c dnsClient, params map[string]string) dnsClient {
+func (c clientWithEdns0Subnet) Unwrap() dnsClient { return c.dnsClient }
+
+// isEdns0SubnetParam reports the params consumed by wrapClientWithEdns0Subnet.
+func isEdns0SubnetParam(key string) bool {
+	switch key {
+	case "ecs", "ecs-override":
+		return true
+	}
+	return false
+}
+
+func wrapClientWithEdns0Subnet(c dnsClient, params map[string]string) dnsClient {
 	var ecsPrefix netip.Prefix
 	var ecsOverride bool
 	if ecs := params["ecs"]; ecs != "" {
@@ -378,6 +425,7 @@ func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.M
 	for _, client := range clients {
 		if _, isRCodeClient := client.(rcodeClient); isRCodeClient {
 			msg, err = client.ExchangeContext(ctx, m)
+			traceAnswer(ctx, msg, client.Address())
 			return msg, false, err
 		}
 		client := client // shadow define client to ensure the value captured by the closure will not be changed in the next loop
@@ -391,6 +439,7 @@ func batchExchange(ctx context.Context, clients []dnsClient, m *D.Msg) (msg *D.M
 				// so we would ignore RCode errors from RCode clients.
 				return nil, errors.New("server failure: " + D.RcodeToString[m.Rcode])
 			}
+			traceAnswer(ctx, m, client.Address())
 			log.Debugln("[DNS] %s --> %s from %s", domain, msgToLogString(m), client.Address())
 			return m, nil
 		})

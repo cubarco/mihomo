@@ -63,6 +63,7 @@ type tunSchema struct {
 	Enable              bool        `yaml:"enable" json:"enable"`
 	Device              *string     `yaml:"device" json:"device"`
 	Stack               *C.TUNStack `yaml:"stack" json:"stack"`
+	DNSMode             *string     `yaml:"dns-mode" json:"dns-mode,omitempty"`
 	DNSHijack           *[]string   `yaml:"dns-hijack" json:"dns-hijack"`
 	AutoRoute           *bool       `yaml:"auto-route" json:"auto-route"`
 	AutoDetectInterface *bool       `yaml:"auto-detect-interface" json:"auto-detect-interface"`
@@ -97,6 +98,8 @@ type tunSchema struct {
 	ExcludeMACAddress                     *[]string       `yaml:"exclude-mac-address" json:"exclude-mac-address,omitempty"`
 	EndpointIndependentNat                *bool           `yaml:"endpoint-independent-nat" json:"endpoint-independent-nat,omitempty"`
 	UDPTimeout                            *int64          `yaml:"udp-timeout" json:"udp-timeout,omitempty"`
+	ICMPTimeout                           *int64          `yaml:"icmp-timeout" json:"icmp-timeout,omitempty"`
+	CongestionController                  *string         `yaml:"congestion-controller" json:"congestion-controller,omitempty"`
 	FileDescriptor                        *int            `yaml:"file-descriptor" json:"file-descriptor"`
 
 	Inet4RouteAddress        *[]netip.Prefix `yaml:"inet4-route-address" json:"inet4-route-address,omitempty"`
@@ -145,6 +148,9 @@ func pointerOrDefaultTun(p *tunSchema, def LC.Tun) LC.Tun {
 		}
 		if p.Stack != nil {
 			def.Stack = *p.Stack
+		}
+		if p.DNSMode != nil {
+			def.DNSMode = *p.DNSMode
 		}
 		if p.DNSHijack != nil {
 			def.DNSHijack = *p.DNSHijack
@@ -257,6 +263,12 @@ func pointerOrDefaultTun(p *tunSchema, def LC.Tun) LC.Tun {
 		if p.UDPTimeout != nil {
 			def.UDPTimeout = *p.UDPTimeout
 		}
+		if p.ICMPTimeout != nil {
+			def.ICMPTimeout = *p.ICMPTimeout
+		}
+		if p.CongestionController != nil {
+			def.CongestionController = *p.CongestionController
+		}
 		if p.FileDescriptor != nil {
 			def.FileDescriptor = *p.FileDescriptor
 		}
@@ -321,6 +333,14 @@ func patchConfigs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if general.Tun != nil && general.Tun.DNSMode != nil {
+		if err := LC.ValidateTunDNSMode(*general.Tun.DNSMode); err != nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, ErrBadRequest)
+			return
+		}
+	}
+
 	if general.AllowLan != nil {
 		listener.SetAllowLan(*general.AllowLan)
 	}
@@ -378,7 +398,7 @@ func patchConfigs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if general.IPv6 != nil {
-		resolver.DisableIPv6 = !*general.IPv6
+		resolver.DisableIPv6.Store(!*general.IPv6)
 	}
 
 	render.NoContent(w, r)

@@ -8,6 +8,7 @@ import (
 )
 
 const (
+	IdentityHeaderLength   = 16
 	IdentityAuthTagLength  = 16
 	IdentityExporterLength = 32
 	IdentityExporterLabel  = "EXPORTER-Dler-Snell-Identity-v2"
@@ -22,6 +23,10 @@ func IdentityV2HeaderFromPSK(psk []byte) []byte {
 }
 
 func IdentityV2AuthTag(psk, exporter, salt []byte) ([]byte, error) {
+	return identityAuthTag(psk, exporter, salt, identityWireMagicV2)
+}
+
+func identityAuthTag(psk, exporter, salt []byte, magic string) ([]byte, error) {
 	if len(psk) == 0 {
 		return nil, errors.New("snell identity psk is empty")
 	}
@@ -36,7 +41,7 @@ func IdentityV2AuthTag(psk, exporter, salt []byte) ([]byte, error) {
 	authKey := identityV2Expand(root, "authentication")
 	identity := IdentityV2HeaderFromPSK(psk)
 	mac := hmac.New(sha256.New, authKey[:])
-	_, _ = mac.Write([]byte(identityWireMagicV2))
+	_, _ = mac.Write([]byte(magic))
 	_, _ = mac.Write(exporter)
 	_, _ = mac.Write(salt)
 	_, _ = mac.Write(identity)

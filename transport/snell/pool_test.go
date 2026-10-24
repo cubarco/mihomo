@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	CP "github.com/metacubex/mihomo/component/pool"
 	"github.com/metacubex/mihomo/transport/shadowsocks/shadowaead"
 )
 
@@ -231,4 +232,143 @@ func (zeroChunkConn) SetReadDeadline(time.Time) error {
 
 func (zeroChunkConn) SetWriteDeadline(time.Time) error {
 	return nil
+}
+
+func TestPoolWarmStopsOnceClosed(t *testing.T) {
+	var pool *Pool
+	dials := 0
+	pool = NewPool(func(context.Context) (*Snell, error) {
+		dials++
+		if dials == 1 {
+			_ = pool.Close()
+		}
+		conn, peer := net.Pipe()
+		t.Cleanup(func() { _ = peer.Close() })
+		return &Snell{Conn: conn}, nil
+	})
+	pool.Warm(context.Background(), 3)
+	if dials != 1 {
+		t.Fatalf("warm-up dialed %d connections, want 1 before the pool closed", dials)
+	}
+}
+
+// The pool only ages entries out when something asks for one, so a connection
+// nobody asks for would hold its transport (an HTTP/3 stream pins its QUIC
+// session) for as long as the pool lives.
+func TestPooledConnectionIsClosedAfterItsIdleAgeWithoutAGet(t *testing.T) {
+	pool := NewPool(func(context.Context) (*Snell, error) {
+		return &Snell{Conn: newScriptedConn()}, nil
+	})
+	pool.idleAge = 50 * time.Millisecond
+	idle := newScriptedConn()
+	pool.put(&Snell{Conn: idle}, 0)
+
+	waitClosed(t, idle)
+	conn, err := pool.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pc := conn.(*PoolConn); pc.Reused() {
+		t.Fatal("an aged-out connection was handed out")
+	}
+}
+
+func TestClaimedPooledConnectionOutlivesItsIdleAge(t *testing.T) {
+	pool := NewPool(func(context.Context) (*Snell, error) {
+		return nil, errors.New("unexpected dial")
+	})
+	pool.idleAge = 100 * time.Millisecond
+	busy := newScriptedConn()
+	pool.put(&Snell{Conn: busy}, 0)
+	conn, err := pool.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc := conn.(*PoolConn)
+	if !pc.Reused() {
+		t.Fatal("the idle connection was not reused")
+	}
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-busy.closed:
+		t.Fatal("a connection in use was closed by its idle age")
+	default:
+	}
+}
+
+func TestRepooledConnectionStartsANewIdleAge(t *testing.T) {
+	pool := NewPool(func(context.Context) (*Snell, error) {
+		return nil, errors.New("unexpected dial")
+	})
+	pool.idleAge = 300 * time.Millisecond
+	client, server := net.Pipe()
+	defer server.Close()
+	closed := make(chan struct{})
+	go func() { _, _ = io.Copy(io.Discard, server); close(closed) }()
+	pool.put(&Snell{Conn: client}, 0)
+	time.Sleep(200 * time.Millisecond)
+	taken, err := pool.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _, _ = server.Write([]byte{'x'}) }()
+	pooled := taken.(*PoolConn).Snell
+	if _, err = pooled.Conn.Read(make([]byte, 1)); err != nil {
+		t.Fatal(err)
+	}
+	pool.put(pooled, 0)
+	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-closed:
+		t.Fatal("the first wait's timer closed a connection parked again")
+	default:
+	}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the connection parked again was never closed")
+	}
+}
+
+func TestPoolDialRejectsClosedPool(t *testing.T) {
+	called := false
+	p := NewPool(func(context.Context) (*Snell, error) {
+		called = true
+		return &Snell{Conn: &recordingConn{}}, nil
+	})
+	_ = p.Close()
+	conn, err := p.Dial(context.Background())
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if !errors.Is(err, CP.ErrClosed) || called {
+		t.Fatalf("closed pool dial: error=%v, factory called=%v", err, called)
+	}
+}
+
+func TestPoolDialDiscardsConnectionWhenClosedDuringDial(t *testing.T) {
+	raw := &recordingConn{}
+	started, resume := make(chan struct{}), make(chan struct{})
+	p := NewPool(func(context.Context) (*Snell, error) {
+		close(started)
+		<-resume
+		return &Snell{Conn: raw}, nil
+	})
+	result := make(chan error, 1)
+	go func() {
+		conn, err := p.Dial(context.Background())
+		if conn != nil {
+			_ = conn.Close()
+		}
+		result <- err
+	}()
+	<-started
+	_ = p.Close()
+	close(resume)
+	if err := <-result; !errors.Is(err, CP.ErrClosed) {
+		t.Fatalf("dial published a connection after pool close: %v", err)
+	}
+	if !raw.closed {
+		t.Fatal("late connection was not closed")
+	}
 }

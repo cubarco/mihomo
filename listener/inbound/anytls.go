@@ -6,17 +6,21 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/listener/anytls"
 	LC "github.com/metacubex/mihomo/listener/config"
+	"github.com/metacubex/mihomo/listener/restls"
 	"github.com/metacubex/mihomo/log"
 )
 
 type AnyTLSOption struct {
 	BaseOption
 	Users          map[string]string `inbound:"users,omitempty"`
-	Certificate    string            `inbound:"certificate"`
-	PrivateKey     string            `inbound:"private-key"`
+	Certificate    string            `inbound:"certificate,omitempty"`
+	PrivateKey     string            `inbound:"private-key,omitempty"`
 	ClientAuthType string            `inbound:"client-auth-type,omitempty"`
 	ClientAuthCert string            `inbound:"client-auth-cert,omitempty"`
 	EchKey         string            `inbound:"ech-key,omitempty"`
+	ShadowTLS      ShadowTLS         `inbound:"shadow-tls,omitempty"`
+	ResTLS         ResTLS            `inbound:"res-tls,omitempty"`
+	JLSConfig      JLSConfig         `inbound:"jls-config,omitempty"`
 	AllowInsecure  bool              `inbound:"allow-insecure,omitempty"`
 	PaddingScheme  string            `inbound:"padding-scheme,omitempty"`
 }
@@ -33,6 +37,11 @@ type AnyTLS struct {
 }
 
 func NewAnyTLS(options *AnyTLSOption) (*AnyTLS, error) {
+	if options.ResTLS.Enable {
+		if err := restls.Validate(options.ResTLS.Build()); err != nil {
+			return nil, err
+		}
+	}
 	base, err := NewBase(&options.BaseOption)
 	if err != nil {
 		return nil, err
@@ -49,6 +58,9 @@ func NewAnyTLS(options *AnyTLSOption) (*AnyTLS, error) {
 			ClientAuthType: options.ClientAuthType,
 			ClientAuthCert: options.ClientAuthCert,
 			EchKey:         options.EchKey,
+			ShadowTLS:      options.ShadowTLS.Build(),
+			ResTLS:         options.ResTLS.Build(),
+			JLSConfig:      options.JLSConfig.Build(),
 			AllowInsecure:  options.AllowInsecure,
 			PaddingScheme:  options.PaddingScheme,
 		},
@@ -74,8 +86,9 @@ func (v *AnyTLS) Address() string {
 // Listen implements constant.InboundListener
 func (v *AnyTLS) Listen(tunnel C.Tunnel) error {
 	var err error
-	v.l, err = anytls.New(v.vs, tunnel, v.Additions()...)
+	v.l, err = anytls.New(v.vs, v.ListenConfig(), tunnel, v.Additions()...)
 	if err != nil {
+		v.l = nil
 		return err
 	}
 	log.Infoln("AnyTLS[%s] proxy listening at: %s", v.Name(), v.Address())
@@ -84,6 +97,9 @@ func (v *AnyTLS) Listen(tunnel C.Tunnel) error {
 
 // Close implements constant.InboundListener
 func (v *AnyTLS) Close() error {
+	if v.l == nil {
+		return nil
+	}
 	return v.l.Close()
 }
 

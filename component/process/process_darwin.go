@@ -33,7 +33,7 @@ var structSize = func() int {
 	}
 }()
 
-func findProcessName(network string, ip netip.Addr, port int) (uint32, string, error) {
+func findProcessName(network string, ip netip.Addr, port int, inspect processInspector) (uint32, string, error) {
 	var spath string
 	switch network {
 	case TCP:
@@ -44,69 +44,51 @@ func findProcessName(network string, ip netip.Addr, port int) (uint32, string, e
 		return 0, "", ErrInvalidNetwork
 	}
 
-	isIPv4 := ip.Is4()
-
 	value, err := unix.SysctlRaw(spath)
 	if err != nil {
 		return 0, "", err
 	}
+	pid, err := findDarwinSocketOwner(value, network, ip, uint16(port))
+	if err != nil {
+		return 0, "", err
+	}
+	path, err := getExecPathFromPID(pid)
+	if err == nil && inspect != nil {
+		inspect(pid, path)
+	}
+	return 0, path, err
+}
 
-	buf := value
+func findDarwinSocketOwner(buf []byte, network string, ip netip.Addr, port uint16) (uint32, error) {
+	ip = ip.Unmap()
 	itemSize := structSize
 	if network == TCP {
-		// rup8(sizeof(xtcpcb_n))
 		itemSize += 208
 	}
-
-	var fallbackUDPProcess string
-	// skip the first xinpgen(24 bytes) block
-	for i := 24; i+itemSize <= len(buf); i += itemSize {
-		// offset of xinpcb_n and xsocket_n
-		inp, so := i, i+104
-
-		srcPort := binary.BigEndian.Uint16(buf[inp+18 : inp+20])
-		if uint16(port) != srcPort {
-			continue
+	selected, err := selectSocketOwner(network, ip, port, func(yield func(socketOwner) bool) {
+		// Skip xinpgen; xinpcb_n and xsocket_n are aligned to eight bytes.
+		for i := 24; i+itemSize <= len(buf); i += itemSize {
+			inp, so := i, i+104
+			srcPort := binary.BigEndian.Uint16(buf[inp+18 : inp+20])
+			if srcPort != port {
+				continue
+			}
+			flag := buf[inp+44]
+			var srcIP netip.Addr
+			switch {
+			case flag&0x1 > 0 && ip.Is4():
+				srcIP, _ = netip.AddrFromSlice(buf[inp+76 : inp+80])
+			case flag&0x2 > 0 && ip.Is6():
+				srcIP, _ = netip.AddrFromSlice(buf[inp+64 : inp+80])
+			default:
+				continue
+			}
+			if !yield(socketOwner{address: srcIP, port: srcPort, pid: readNativeUint32(buf[so+68 : so+72])}) {
+				return
+			}
 		}
-
-		// xinpcb_n.inp_vflag
-		flag := buf[inp+44]
-
-		var (
-			srcIP     netip.Addr
-			srcIsIPv4 bool
-		)
-		switch {
-		case flag&0x1 > 0 && isIPv4:
-			// ipv4
-			srcIP, _ = netip.AddrFromSlice(buf[inp+76 : inp+80])
-			srcIsIPv4 = true
-		case flag&0x2 > 0 && !isIPv4:
-			// ipv6
-			srcIP, _ = netip.AddrFromSlice(buf[inp+64 : inp+80])
-		default:
-			continue
-		}
-		srcIP = srcIP.Unmap()
-
-		if ip == srcIP {
-			// xsocket_n.so_last_pid
-			pid := readNativeUint32(buf[so+68 : so+72])
-			pp, err := getExecPathFromPID(pid)
-			return 0, pp, err
-		}
-
-		// udp packet connection may be not equal with srcIP
-		if network == UDP && srcIP.IsUnspecified() && isIPv4 == srcIsIPv4 {
-			fallbackUDPProcess, _ = getExecPathFromPID(readNativeUint32(buf[so+68 : so+72]))
-		}
-	}
-
-	if network == UDP && fallbackUDPProcess != "" {
-		return 0, fallbackUDPProcess, nil
-	}
-
-	return 0, "", ErrNotFound
+	})
+	return selected.pid, err
 }
 
 func getExecPathFromPID(pid uint32) (string, error) {

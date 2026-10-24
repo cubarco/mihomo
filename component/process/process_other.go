@@ -4,7 +4,7 @@ package process
 
 import "net/netip"
 
-func findProcessName(network string, ip netip.Addr, srcPort int) (uint32, string, error) {
+func findProcessName(network string, ip netip.Addr, srcPort int, inspect processInspector) (uint32, string, error) {
 	return 0, "", ErrPlatformNotSupport
 }
 

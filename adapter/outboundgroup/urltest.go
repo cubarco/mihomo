@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/callback"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/singledo"
@@ -14,23 +16,20 @@ import (
 	P "github.com/metacubex/mihomo/constant/provider"
 )
 
-type urlTestOption func(*URLTest)
-
-func urlTestWithTolerance(tolerance uint16) urlTestOption {
-	return func(u *URLTest) {
-		u.tolerance = tolerance
-	}
+type URLTestOption struct {
+	Tolerance uint16 `group:"tolerance,omitempty"`
 }
 
 type URLTest struct {
 	*GroupBase
-	selected       string
+	selected       atomic.TypedValue[string]
 	testUrl        string
 	expectedStatus string
 	tolerance      uint16
 	disableUDP     bool
 	fastNode       C.Proxy
 	fastSingle     *singledo.Single[C.Proxy]
+	fastMu         sync.Mutex
 }
 
 func (u *URLTest) Now() string {
@@ -53,8 +52,21 @@ func (u *URLTest) Set(name string) error {
 }
 
 func (u *URLTest) ForceSet(name string) {
-	u.selected = name
+	u.fastMu.Lock()
+	defer u.fastMu.Unlock()
+	u.selected.Store(name)
 	u.fastSingle.Reset()
+}
+
+// ResetSelection discards the cached fastest node so the next Now or dial
+// re-evaluates member health, for example after a manual probe changed it.
+func (u *URLTest) ResetSelection() {
+	u.fastSingle.Reset()
+}
+
+// TestURL is the URL whose per-proxy health this group selects on.
+func (u *URLTest) TestURL() string {
+	return u.testUrl
 }
 
 // DialContext implements C.ProxyAdapter
@@ -106,26 +118,26 @@ func (u *URLTest) healthCheck() {
 
 func (u *URLTest) fast(touch bool) C.Proxy {
 	elm, _, shared := u.fastSingle.Do(func() (C.Proxy, error) {
+		u.fastMu.Lock()
+		defer u.fastMu.Unlock()
 		proxies := u.GetProxies(touch)
-		if u.selected != "" {
+		if selected := u.selected.Load(); selected != "" {
 			for _, proxy := range proxies {
 				if !proxy.AliveForTestUrl(u.testUrl) {
 					continue
 				}
-				if proxy.Name() == u.selected {
+				if proxy.Name() == selected {
 					u.fastNode = proxy
 					return proxy, nil
 				}
 			}
 		}
 
-		fast := proxies[0]
-		minDelay := fast.LastDelayForTestUrl(u.testUrl)
-		fastNotExist := true
-
-		for _, proxy := range proxies[1:] {
+		var fast, current C.Proxy
+		var minDelay uint16
+		for _, proxy := range proxies {
 			if u.fastNode != nil && proxy.Name() == u.fastNode.Name() {
-				fastNotExist = false
+				current = proxy
 			}
 
 			if !proxy.AliveForTestUrl(u.testUrl) {
@@ -133,17 +145,21 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 			}
 
 			delay := proxy.LastDelayForTestUrl(u.testUrl)
-			if delay < minDelay {
+			if fast == nil || delay < minDelay {
 				fast = proxy
 				minDelay = delay
 			}
-
 		}
-		// tolerance
-		if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) || u.fastNode.LastDelayForTestUrl(u.testUrl) > fast.LastDelayForTestUrl(u.testUrl)+u.tolerance {
-			u.fastNode = fast
+		if fast == nil {
+			fast = current
+			if fast == nil {
+				fast = proxies[0]
+			}
+		} else if current != nil && current.AliveForTestUrl(u.testUrl) && uint32(current.LastDelayForTestUrl(u.testUrl)) <= uint32(minDelay)+uint32(u.tolerance) {
+			fast = current
 		}
-		return u.fastNode, nil
+		u.fastNode = fast
+		return fast, nil
 	})
 	if shared && touch { // a shared fastSingle.Do() may cause providers untouched, so we touch them again
 		u.Touch()
@@ -177,7 +193,7 @@ func (u *URLTest) MarshalJSON() ([]byte, error) {
 		"all":            all,
 		"testUrl":        u.testUrl,
 		"expectedStatus": u.expectedStatus,
-		"fixed":          u.selected,
+		"fixed":          u.selected.Load(),
 		"hidden":         u.Hidden(),
 		"icon":           u.Icon(),
 		"emptyFallback":  u.EmptyFallback().Name(),
@@ -196,20 +212,10 @@ func (u *URLTest) URLTest(ctx context.Context, url string, expectedStatus utils.
 	return u.GroupBase.URLTest(ctx, u.testUrl, expectedStatus)
 }
 
-func parseURLTestOption(config map[string]any) []urlTestOption {
-	opts := []urlTestOption{}
-
-	// tolerance
-	if elm, ok := config["tolerance"]; ok {
-		if tolerance, ok := elm.(int); ok {
-			opts = append(opts, urlTestWithTolerance(uint16(tolerance)))
-		}
+func NewURLTest(option GroupCommonOption, urlTestOption URLTestOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (*URLTest, error) {
+	if emptyFallback == nil {
+		return nil, errors.New("empty fallback proxy not exist")
 	}
-
-	return opts
-}
-
-func NewURLTest(option *GroupCommonOption, emptyFallback C.Proxy, providers []P.ProxyProvider, options ...urlTestOption) *URLTest {
 	urlTest := &URLTest{
 		GroupBase: NewGroupBase(GroupBaseOption{
 			Name:           option.Name,
@@ -223,16 +229,14 @@ func NewURLTest(option *GroupCommonOption, emptyFallback C.Proxy, providers []P.
 			MaxFailedTimes: option.MaxFailedTimes,
 			EmptyFallback:  emptyFallback,
 			Providers:      providers,
+			UsePosition:    option.UsePosition,
 		}),
 		fastSingle:     singledo.NewSingle[C.Proxy](time.Second * 10),
 		disableUDP:     option.DisableUDP,
 		testUrl:        option.URL,
 		expectedStatus: option.ExpectedStatus,
+		tolerance:      urlTestOption.Tolerance,
 	}
 
-	for _, option := range options {
-		option(urlTest)
-	}
-
-	return urlTest
+	return urlTest, nil
 }

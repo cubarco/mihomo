@@ -1,6 +1,7 @@
 package cachefile
 
 import (
+	"bytes"
 	"net/netip"
 
 	"github.com/metacubex/mihomo/log"
@@ -83,6 +84,33 @@ func (c *FakeIpStore) PutByIP(ip netip.Addr, host string) {
 	}
 }
 
+func (c *FakeIpStore) PutMapping(host string, ip netip.Addr) error {
+	if c.DB == nil {
+		return nil
+	}
+	hostKey, addr := []byte(host), ip.AsSlice()
+	return c.DB.Update(func(t *bbolt.Tx) error {
+		bucket, err := t.CreateBucketIfNotExists(c.bucketName)
+		if err != nil {
+			return err
+		}
+		if oldHost := bucket.Get(addr); len(oldHost) > 0 && !bytes.Equal(oldHost, hostKey) && bytes.Equal(bucket.Get(oldHost), addr) {
+			if err := bucket.Delete(oldHost); err != nil {
+				return err
+			}
+		}
+		if oldIP := bucket.Get(hostKey); len(oldIP) > 0 && !bytes.Equal(oldIP, addr) && bytes.Equal(bucket.Get(oldIP), hostKey) {
+			if err := bucket.Delete(oldIP); err != nil {
+				return err
+			}
+		}
+		if err := bucket.Put(hostKey, addr); err != nil {
+			return err
+		}
+		return bucket.Put(addr, hostKey)
+	})
+}
+
 func (c *FakeIpStore) DelByIP(ip netip.Addr) {
 	if c.DB == nil {
 		return
@@ -109,6 +137,9 @@ func (c *FakeIpStore) DelByIP(ip netip.Addr) {
 }
 
 func (c *FakeIpStore) FlushFakeIP() error {
+	if c.DB == nil {
+		return nil
+	}
 	err := c.DB.Batch(func(t *bbolt.Tx) error {
 		bucket := t.Bucket(c.bucketName)
 		if bucket == nil {

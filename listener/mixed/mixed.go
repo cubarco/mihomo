@@ -1,8 +1,10 @@
 package mixed
 
 import (
+	"context"
 	"errors"
 	"net"
+	"sync/atomic"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	N "github.com/metacubex/mihomo/common/net"
@@ -25,7 +27,7 @@ import (
 type Listener struct {
 	listener net.Listener
 	addr     string
-	closed   bool
+	closed   atomic.Bool
 }
 
 // RawAddress implements C.Listener
@@ -40,15 +42,15 @@ func (l *Listener) Address() string {
 
 // Close implements C.Listener
 func (l *Listener) Close() error {
-	l.closed = true
+	l.closed.Store(true)
 	return l.listener.Close()
 }
 
 func New(addr string, tunnel C.Tunnel, additions ...inbound.Addition) (*Listener, error) {
-	return NewWithConfig(LC.AuthServer{Enable: true, Listen: addr, AuthStore: authStore.Default}, tunnel, additions...)
+	return NewWithConfig(LC.AuthServer{Enable: true, Listen: addr, AuthStore: authStore.Default}, inbound.NewListenConfig(), tunnel, additions...)
 }
 
-func NewWithConfig(config LC.AuthServer, tunnel C.Tunnel, additions ...inbound.Addition) (*Listener, error) {
+func NewWithConfig(config LC.AuthServer, lc C.InboundListenConfig, tunnel C.Tunnel, additions ...inbound.Addition) (*Listener, error) {
 	isDefault := false
 	if len(additions) == 0 {
 		isDefault = true
@@ -58,10 +60,16 @@ func NewWithConfig(config LC.AuthServer, tunnel C.Tunnel, additions ...inbound.A
 		}
 	}
 
-	l, err := inbound.Listen("tcp", config.Listen)
+	l, err := lc.Listen(context.Background(), "tcp", config.Listen)
 	if err != nil {
 		return nil, err
 	}
+	owned := false
+	defer func() {
+		if !owned {
+			_ = l.Close()
+		}
+	}()
 
 	tlsConfig := &tls.Config{Time: ntp.Now}
 	var realityBuilder *reality.Builder
@@ -122,7 +130,7 @@ func NewWithConfig(config LC.AuthServer, tunnel C.Tunnel, additions ...inbound.A
 		for {
 			c, err := ml.listener.Accept()
 			if err != nil {
-				if ml.closed {
+				if ml.closed.Load() {
 					break
 				}
 				continue
@@ -141,6 +149,7 @@ func NewWithConfig(config LC.AuthServer, tunnel C.Tunnel, additions ...inbound.A
 		}
 	}()
 
+	owned = true
 	return ml, nil
 }
 

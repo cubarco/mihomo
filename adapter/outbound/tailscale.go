@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,13 +18,16 @@ import (
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/iface/anet"
 	"github.com/metacubex/mihomo/component/resolver"
+	"github.com/metacubex/mihomo/component/tailnet"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/log"
 
+	ts "github.com/metacubex/tailscale"
 	"github.com/metacubex/tailscale/envknob"
 	"github.com/metacubex/tailscale/hostinfo"
 	"github.com/metacubex/tailscale/ipn"
+	"github.com/metacubex/tailscale/ipn/ipnstate"
 	"github.com/metacubex/tailscale/net/netmon"
 	"github.com/metacubex/tailscale/tailcfg"
 	"github.com/metacubex/tailscale/tsnet"
@@ -32,21 +37,19 @@ import (
 
 type Tailscale struct {
 	*Base
-	server      *tsnet.Server
-	dnsResolver *dns.Resolver
-	option      TailscaleOption
-	ctx         context.Context
-	cancel      context.CancelFunc
-	startOnce   sync.Once
-	startErr    error
+	dnsResolver  *dns.Resolver
+	dnsTransport tailscaleDNSTransport
+	option       TailscaleOption
+	sessionKey   string
+	seq          uint64
+	ctx          context.Context
+	cancel       context.CancelFunc
 
-	backendInitOnce sync.Once
-	backendInitCh   chan struct{}
-	backendInitErr  error
-
-	serverStarted bool
-
-	unregisterDNSResolver func()
+	mu      sync.Mutex
+	session *tailscaleSession
+	closed  bool
+	// unregister removes the routes and DNS client published for session.
+	unregister func()
 }
 
 type TailscaleOption struct {
@@ -66,7 +69,8 @@ type TailscaleOption struct {
 
 func init() {
 	hostinfo.RegisterHostinfoNewHook(func(hi *tailcfg.Hostinfo) {
-		hi.IPNVersion = C.MihomoName + " " + C.Version
+		versionDotTxt := strings.TrimSpace(ts.VersionDotTxt)
+		hi.IPNVersion = fmt.Sprintf("%s-%s-%s", versionDotTxt, C.MihomoName, C.Version)
 	})
 	envknob.SetNoLogsNoSupport()
 	if runtime.GOOS == "android" { // Android SDK 30 no longer permits Go's net.Interfaces to work (Issue 2293)
@@ -109,16 +113,14 @@ func init() {
 }
 
 func NewTailscale(option TailscaleOption) (*Tailscale, error) {
-	if _, err := buildTailscaleMaskedPrefs(option); err != nil {
-		return nil, err
-	}
 	if option.StateDir == "" {
 		option.StateDir = "tailscale"
 	}
-	option.StateDir = C.Path.Resolve(option.StateDir)
-	if !C.Path.IsSafePath(option.StateDir) {
-		return nil, C.Path.ErrNotSafePath(option.StateDir)
+	stateDir, err := resolveTailscaleStateDir(option.StateDir)
+	if err != nil {
+		return nil, err
 	}
+	option.StateDir = stateDir
 
 	addr := option.ControlURL
 	if addr == "" {
@@ -136,203 +138,393 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
 		}),
-		option:        option,
-		ctx:           ctx,
-		cancel:        cancel,
-		backendInitCh: make(chan struct{}),
+		option:     option,
+		sessionKey: tailscaleSessionKey(option),
+		seq:        tailscaleOutboundSeq.Add(1),
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
-	outbound.server = &tsnet.Server{
-		Dir:        option.StateDir,
-		Hostname:   option.Hostname,
-		AuthKey:    option.AuthKey,
-		ControlURL: option.ControlURL,
-		Ephemeral:  option.Ephemeral,
-		SystemDialer: func(ctx context.Context, network, address string) (net.Conn, error) {
-			log.Debugln("[Tailscale](%s) SystemDialer: start dial %s %s", option.Name, network, address)
-			conn, err := outbound.dialer.DialContext(ctx, network, address)
-			log.Debugln("[Tailscale](%s) SystemDialer: finish dial %s %s, err: %v", option.Name, network, address, err)
-			return conn, err
-		},
-		SystemPacketListener: func(ctx context.Context, network, address string) (net.PacketConn, error) {
-			log.Debugln("[Tailscale](%s) SystemPacketListener: start listen %s %s", option.Name, network, address)
-			pc, err := outbound.dialer.ListenPacket(ctx, network, address, netip.AddrPort{})
-			log.Debugln("[Tailscale](%s) SystemPacketListener: finish listen %s %s, err: %v", option.Name, network, address, err)
-			return pc, err
-		},
-		ExtraRootCAs: ca.GetCertPool(),
-		LookupHook: func(ctx context.Context, host string) ([]netip.Addr, error) {
-			log.Debugln("[Tailscale](%s) LookupHook: start lookup %s", option.Name, host)
-			ips, err := resolver.LookupIPWithResolver(ctx, host, resolver.ProxyServerHostResolver)
-			log.Debugln("[Tailscale](%s) LookupHook: finish lookup %s, ips: %v, err: %v", option.Name, host, ips, err)
-			return ips, err
-		},
-		UserLogf: func(format string, args ...any) {
-			log.Infoln("[Tailscale](%s) %s", option.Name, fmt.Sprintf(format, args...))
-		},
-		Logf: func(format string, args ...any) {
-			log.Debugln("[Tailscale](%s) %s", option.Name, fmt.Sprintf(format, args...))
-		},
-	}
-	dnsTransport := tailscaleDNSTransport{tailscale: outbound}
-	outbound.dnsResolver = dns.NewResolverFromClient(dnsTransport)
-	outbound.unregisterDNSResolver = dns.RegisterTailscaleDnsClient(option.Name, dnsTransport)
+	outbound.dnsTransport = tailscaleDNSTransport{tailscale: outbound}
+	outbound.dnsResolver = dns.NewResolverFromClient(outbound.dnsTransport)
 	return outbound, nil
 }
 
-func (t *Tailscale) start() error {
-	t.startOnce.Do(func() {
-		if err := t.server.Start(); err != nil {
-			t.startErr = err
-			t.setBackendInitialized(err)
-			return
+// serverFactory must not capture the outbound: a pooled session outlives the
+// config that created it, and the outbound's finalizer releases the session.
+func (t *Tailscale) serverFactory() func(authKey string) *tsnet.Server {
+	option := t.option
+	systemDialer := t.dialer
+	return func(authKey string) *tsnet.Server {
+		if authKey == "" {
+			authKey = option.AuthKey
 		}
-		t.serverStarted = true
+		return &tsnet.Server{
+			Dir:        option.StateDir,
+			Hostname:   option.Hostname,
+			AuthKey:    authKey,
+			ControlURL: option.ControlURL,
+			Ephemeral:  option.Ephemeral,
+			SystemDialer: func(ctx context.Context, network, address string) (net.Conn, error) {
+				log.Debugln("[Tailscale](%s) SystemDialer: start dial %s %s", option.Name, network, address)
+				conn, err := systemDialer.DialContext(ctx, network, address)
+				log.Debugln("[Tailscale](%s) SystemDialer: finish dial %s %s, err: %v", option.Name, network, address, err)
+				return conn, err
+			},
+			SystemPacketListener: func(ctx context.Context, network, address string) (net.PacketConn, error) {
+				log.Debugln("[Tailscale](%s) SystemPacketListener: start listen %s %s", option.Name, network, address)
+				pc, err := systemDialer.ListenPacket(ctx, network, address, netip.AddrPort{})
+				log.Debugln("[Tailscale](%s) SystemPacketListener: finish listen %s %s, err: %v", option.Name, network, address, err)
+				return pc, err
+			},
+			ExtraRootCAs: ca.GetCertPool(),
+			LookupHook: func(ctx context.Context, host string) ([]netip.Addr, error) {
+				log.Debugln("[Tailscale](%s) LookupHook: start lookup %s", option.Name, host)
+				ips, err := resolver.LookupIPWithResolver(ctx, host, resolver.ProxyServerHostResolver)
+				log.Debugln("[Tailscale](%s) LookupHook: finish lookup %s, ips: %v, err: %v", option.Name, host, ips, err)
+				return ips, err
+			},
+			UserLogf: func(format string, args ...any) {
+				log.Infoln("[Tailscale](%s) %s", option.Name, fmt.Sprintf(format, args...))
+			},
+			Logf: func(format string, args ...any) {
+				log.Debugln("[Tailscale](%s) %s", option.Name, fmt.Sprintf(format, args...))
+			},
+		}
+	}
+}
+
+// acquireSession returns the session serving this outbound. The routes and
+// the tailscale:// DNS client are published only then, so an outbound parsed
+// just to validate a config never replaces the running one's. authKey applies
+// only if this call creates the session.
+func (t *Tailscale) acquireSession(authKey string) (*tailscaleSession, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil, errTailscaleClosed
+	}
+	if session := t.session; session != nil {
+		if !session.isClosed() {
+			return session, nil
+		}
+		if err := session.closeError(); !errors.Is(err, errTailscaleRetired) {
+			return nil, err
+		}
+		t.releaseLocked()
+	}
+	option := t.option
+	key := t.sessionKey
+	newServer := t.serverFactory()
+	session, err := tailscaleSessions.acquire(option.StateDir, key, t.seq, func() *tailscaleSession {
+		return newTailscaleSession(option, key, authKey, newServer)
+	})
+	if err != nil {
+		return nil, err
+	}
+	t.session = session
+	unregisterRoutes := tailnet.Register(t.Name(), session)
+	unregisterDNS := dns.RegisterTailscaleDnsClient(t.Name(), t.dnsTransport)
+	t.unregister = func() {
+		unregisterRoutes()
+		unregisterDNS()
+	}
+	return session, nil
+}
+
+func (t *Tailscale) releaseLocked() {
+	if t.session == nil {
+		return
+	}
+	t.unregister()
+	tailscaleSessions.release(t.session)
+	t.session = nil
+	t.unregister = nil
+}
+
+// releaseFailedStart lets an explicit start replace a session that could not
+// start. Traffic keeps reporting the failure, as upstream keeps it for the
+// outbound's lifetime: a failed tsnet start does not release everything it
+// created, so a lasting failure is not retried for every connection.
+func (t *Tailscale) releaseFailedStart() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.session != nil && t.session.isClosed() && errors.As(t.session.closeError(), new(tailscaleStartError)) {
+		t.releaseLocked()
+	}
+}
+
+// currentSession returns the live session serving this outbound without
+// starting one.
+func (t *Tailscale) currentSession() *tailscaleSession {
+	t.mu.Lock()
+	session := t.session
+	t.mu.Unlock()
+	if session != nil && !session.isClosed() {
+		return session
+	}
+	if current := tailscaleSessions.peek(t.option.StateDir, t.sessionKey); current != nil {
+		return current
+	}
+	return session
+}
+
+// sessionRunning reports a started session serving this outbound, or one a
+// replaced outbound left in the pool.
+func (t *Tailscale) sessionRunning() bool {
+	session := t.currentSession()
+	return session != nil && !session.isClosed() && session.isStarted()
+}
+
+// startsUnattended reports a network that can come up without the user: one
+// that is signed in or has an auth key.
+func (t *Tailscale) startsUnattended() bool {
+	return t.option.AuthKey != "" || tailscaleSignedIn(t.option.StateDir)
+}
+
+// needsLogin reports that serving traffic would start a session the user must
+// sign in to. A session that ended for good keeps reporting its own error.
+func (t *Tailscale) needsLogin() bool {
+	t.mu.Lock()
+	closed, own := t.closed, t.session
+	t.mu.Unlock()
+	if closed || (own != nil && own.isClosed() && !errors.Is(own.closeError(), errTailscaleRetired)) {
+		return false
+	}
+	return !t.sessionRunning() && !t.startsUnattended()
+}
+
+func (t *Tailscale) ensureStarted(ctx context.Context) (*tailscaleSession, error) {
+	// Traffic, health checks and DNS never begin a login; only Login does.
+	if t.needsLogin() {
+		return nil, errTailscaleNeedsLogin
+	}
+	session, err := t.acquireSession("")
+	if err != nil {
+		return nil, err
+	}
+	if _, err = session.start(); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(t.ctx, cancel)
+	defer stop()
+	if err = session.waitBackendInitialized(ctx); err != nil {
+		if t.ctx.Err() != nil {
+			return nil, errTailscaleClosed
+		}
+		return nil, err
+	}
+	return session, nil
+}
+
+// Warm starts a network that can come up without the user, retrying one that
+// could not start, and takes over a session a replaced outbound left running,
+// such as a login in progress. Any other network waits for Login, so a config
+// apply never requests a login page.
+func (t *Tailscale) Warm() {
+	if t.startsUnattended() {
+		t.releaseFailedStart()
+	} else if !t.sessionRunning() {
+		return
+	}
+	go func() {
 		ctx, cancel := context.WithTimeout(t.ctx, 30*time.Second)
 		defer cancel()
-		if err := t.applyPrefs(ctx); err != nil {
-			t.startErr = err
-			t.setBackendInitialized(err)
-			return
+		if _, err := t.ensureStarted(ctx); err != nil && t.ctx.Err() == nil {
+			log.Warnln("[Tailscale](%s) start failed: %v", t.Name(), err)
 		}
-		go t.watchBackendState()
-	})
-	return t.startErr
+	}()
 }
 
-func (t *Tailscale) ensureStarted(ctx context.Context) error {
-	if err := t.start(); err != nil {
-		return err
-	}
-	return t.waitBackendInitialized(ctx)
-}
-
-func (t *Tailscale) watchBackendState() {
-	lc, err := t.server.LocalClient()
-	if err != nil {
-		t.setBackendInitialized(err)
-		return
-	}
-	watcher, err := lc.WatchIPNBus(t.ctx, ipn.NotifyInitialState)
-	if err != nil {
-		t.setBackendInitialized(err)
-		return
-	}
-	defer watcher.Close()
-
-	backendInitialized := false
-	exitNodeNeedsStatus := tailscaleExitNodeNeedsStatus(t.option)
-	for {
-		n, err := watcher.Next()
-		if err != nil {
-			t.setBackendInitialized(err)
-			return
-		}
-		if n.State == nil {
-			continue
-		}
-
-		if *n.State != ipn.NoState && !backendInitialized {
-			t.setBackendInitialized(nil)
-			backendInitialized = true
-			if !exitNodeNeedsStatus {
-				return
-			}
-		}
-		if exitNodeNeedsStatus && *n.State == ipn.Running {
-			if err := t.applyExitNodePrefs(t.ctx); err != nil {
-				log.Warnln("[Tailscale](%s) set exit node failed: %v", t.Name(), err)
-			}
-			return
-		}
-	}
-}
-
-func (t *Tailscale) setBackendInitialized(err error) {
-	t.backendInitOnce.Do(func() {
-		t.backendInitErr = err
-		close(t.backendInitCh)
-	})
-}
-
-func (t *Tailscale) waitBackendInitialized(ctx context.Context) error {
-	select {
-	case <-t.backendInitCh:
-		return t.backendInitErr
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-t.ctx.Done():
-		return t.ctx.Err()
-	}
-}
-
-func (t *Tailscale) applyPrefs(ctx context.Context) error {
-	mp, err := buildTailscaleMaskedPrefs(t.option)
+// Login asks control to authorize this device, with authKey when given and
+// interactively otherwise; the login page then appears in Status as AuthURL.
+func (t *Tailscale) Login(ctx context.Context, authKey string) error {
+	t.releaseFailedStart()
+	session, err := t.acquireSession(authKey)
 	if err != nil {
 		return err
 	}
-	if mp == nil {
+	startedNow, err := session.start()
+	if err != nil {
+		return err
+	}
+	if err = session.waitBackendInitialized(ctx); err != nil {
+		return err
+	}
+	if startedNow {
+		// tsnet begins the login itself, with the key or interactively.
 		return nil
 	}
-	lc, err := t.server.LocalClient()
+	lc, err := session.server.LocalClient()
 	if err != nil {
 		return err
 	}
-	_, err = lc.EditPrefs(ctx, mp)
+	status, err := lc.StatusWithoutPeers(ctx)
+	if err != nil {
+		return err
+	}
+	switch status.BackendState {
+	case ipn.Running.String(), ipn.Starting.String():
+		return nil
+	case ipn.Stopped.String():
+		_, err = lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+			Prefs:          ipn.Prefs{WantRunning: true},
+			WantRunningSet: true,
+		})
+		return err
+	}
+	if authKey == "" && status.AuthURL != "" {
+		return nil
+	}
+	// A key only reaches control when a control client starts, and asking a
+	// running backend for another interactive login registers a second node
+	// key. A fresh session starts exactly one login either way.
+	tailscaleSessions.retire(session)
+	session, err = t.acquireSession(authKey)
+	if err != nil {
+		return err
+	}
+	if session.authKey != authKey {
+		return errors.New("tailscale login is already in progress, try again")
+	}
+	_, err = session.start()
 	return err
 }
 
-func (t *Tailscale) applyExitNodePrefs(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	lc, err := t.server.LocalClient()
+// Logout signs this device out. The session is then retired, because a
+// logout resets the control URL and hostname a fresh session restores.
+func (t *Tailscale) Logout(ctx context.Context) error {
+	session := t.currentSession()
+	if session == nil || session.isClosed() || !session.isStarted() {
+		return errTailscaleNotRunning
+	}
+	lc, err := session.server.LocalClient()
 	if err != nil {
 		return err
+	}
+	if err = lc.Logout(ctx); err != nil {
+		return err
+	}
+	tailscaleSessions.retire(session)
+	return nil
+}
+
+// Status reports the session without starting it.
+func (t *Tailscale) Status(ctx context.Context) (*TailscaleStatus, error) {
+	session := t.currentSession()
+	if session == nil || (session.isClosed() && errors.Is(session.closeError(), errTailscaleRetired)) || !session.isStarted() {
+		return &TailscaleStatus{State: TailscaleIdle, Peers: []TailscaleDevice{}}, nil
+	}
+	if session.isClosed() {
+		return &TailscaleStatus{State: TailscaleIdle, Error: session.closeError().Error(), Peers: []TailscaleDevice{}}, nil
+	}
+	lc, err := session.server.LocalClient()
+	if err != nil {
+		return nil, err
 	}
 	status, err := lc.Status(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	mp := &ipn.MaskedPrefs{
-		ExitNodeIPSet: true,
-	}
-	if t.option.ExitNodeAllowLANAccess != nil {
-		mp.ExitNodeAllowLANAccess = *t.option.ExitNodeAllowLANAccess
-		mp.ExitNodeAllowLANAccessSet = true
-	}
-	if err = mp.SetExitNodeIP(t.option.ExitNode, status); err != nil {
-		return err
-	}
-	_, err = lc.EditPrefs(ctx, mp)
-	return err
+	return tailscaleStatusFrom(status), nil
 }
 
-func buildTailscaleMaskedPrefs(option TailscaleOption) (*ipn.MaskedPrefs, error) {
-	var mp ipn.MaskedPrefs
-	changed := false
+// HasExitNode reports whether Internet traffic sent to this outbound has a
+// configured way out of the tailnet.
+func (t *Tailscale) HasExitNode() bool {
+	return t.option.ExitNode != ""
+}
 
+// PingPeers measures the tailnet itself: the first disco pong from up to three
+// peers, online and direct ones first. It needs no Internet egress.
+func (t *Tailscale) PingPeers(ctx context.Context) (time.Duration, error) {
+	session, err := t.ensureStarted(ctx)
+	if err != nil {
+		return 0, err
+	}
+	lc, err := session.server.LocalClient()
+	if err != nil {
+		return 0, err
+	}
+	status, err := lc.Status(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if status.BackendState != ipn.Running.String() {
+		return 0, fmt.Errorf("tailscale is %s", status.BackendState)
+	}
+	var candidates []*ipnstate.PeerStatus
+	for _, peer := range status.Peer {
+		if len(peer.TailscaleIPs) > 0 {
+			candidates = append(candidates, peer)
+		}
+	}
+	if len(candidates) == 0 {
+		return 0, errors.New("no tailscale peer")
+	}
+	// Control's online flag is advisory: a peer it calls offline may only have
+	// lost its control connection, so it is tried after the online ones.
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].Online != candidates[j].Online {
+			return candidates[i].Online
+		}
+		return candidates[i].CurAddr != "" && candidates[j].CurAddr == ""
+	})
+	if len(candidates) > 3 {
+		candidates = candidates[:3]
+	}
+	pingCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type pingResult struct {
+		latency time.Duration
+		err     error
+	}
+	results := make(chan pingResult, len(candidates))
+	for _, peer := range candidates {
+		go func(addr netip.Addr) {
+			result, err := lc.Ping(pingCtx, addr, tailcfg.PingDisco)
+			switch {
+			case err != nil:
+				results <- pingResult{err: err}
+			case result.Err != "":
+				results <- pingResult{err: errors.New(result.Err)}
+			default:
+				results <- pingResult{latency: time.Duration(result.LatencySeconds * float64(time.Second))}
+			}
+		}(peer.TailscaleIPs[0])
+	}
+	var lastErr error
+	for range candidates {
+		result := <-results
+		if result.err == nil {
+			return result.latency, nil
+		}
+		lastErr = result.err
+	}
+	return 0, lastErr
+}
+
+func buildTailscaleMaskedPrefs(option TailscaleOption) *ipn.MaskedPrefs {
+	// The state directory retains preferences across server replacements.
+	mp := &ipn.MaskedPrefs{
+		ExitNodeIDSet:             true,
+		ExitNodeIPSet:             true,
+		AutoExitNodeSet:           true,
+		ExitNodeAllowLANAccessSet: true,
+	}
 	if option.AcceptRoutes != nil {
 		mp.RouteAll = *option.AcceptRoutes
 		mp.RouteAllSet = true
-		changed = true
 	}
-	if option.ExitNode != "" {
-		if autoExitNode, ok := ipn.ParseAutoExitNodeString(option.ExitNode); ok {
-			mp.AutoExitNode = autoExitNode
-			mp.AutoExitNodeSet = true
-			changed = true
-		}
+	if autoExitNode, ok := ipn.ParseAutoExitNodeString(option.ExitNode); ok {
+		mp.AutoExitNode = autoExitNode
 	}
 	if option.ExitNodeAllowLANAccess != nil && !tailscaleExitNodeNeedsStatus(option) {
 		mp.ExitNodeAllowLANAccess = *option.ExitNodeAllowLANAccess
-		mp.ExitNodeAllowLANAccessSet = true
-		changed = true
 	}
-	if !changed {
-		return nil, nil
-	}
-	return &mp, nil
+	return mp
 }
 
 func tailscaleExitNodeNeedsStatus(option TailscaleOption) bool {
@@ -344,14 +536,15 @@ func tailscaleExitNodeNeedsStatus(option TailscaleOption) bool {
 }
 
 func (t *Tailscale) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
-	if err = t.ensureStarted(ctx); err != nil {
-		return nil, err
-	}
-	netStack, err := t.server.Netstack(ctx)
+	session, err := t.ensureStarted(ctx)
 	if err != nil {
 		return nil, err
 	}
-	v4, v6 := t.server.TailscaleIPs()
+	netStack, err := session.server.Netstack(ctx)
+	if err != nil {
+		return nil, err
+	}
+	v4, v6 := session.server.TailscaleIPs()
 	options := t.DialOptions()
 	options = append(options, dialer.WithResolver(t.dnsResolver))
 	options = append(options, dialer.WithNetDialer(dialer.NetDialerFunc(func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -369,8 +562,12 @@ func (t *Tailscale) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.
 		}
 		return tcpConn, nil
 	})))
+	address := metadata.RemoteAddress()
+	if addr, ok := t.routedAddr(ctx, metadata); ok {
+		address = netip.AddrPortFrom(addr, metadata.DstPort).String()
+	}
 	var conn net.Conn
-	conn, err = dialer.NewDialer(options...).DialContext(ctx, "tcp", metadata.RemoteAddress())
+	conn, err = dialer.NewDialer(options...).DialContext(ctx, "tcp", address)
 	if err != nil {
 		return nil, err
 	}
@@ -381,28 +578,63 @@ func (t *Tailscale) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.
 }
 
 func (t *Tailscale) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
-	if err = t.ensureStarted(ctx); err != nil {
+	session, err := t.ensureStarted(ctx)
+	if err != nil {
 		return nil, err
 	}
 	if err = t.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
-	v4, v6 := t.server.TailscaleIPs()
+	v4, v6 := session.server.TailscaleIPs()
 	src := v4
 	if metadata.DstIP.Is6() {
 		src = v6
 	}
-	pc, err := t.server.ListenPacket("udp", net.JoinHostPort(src.String(), "0"))
+	pc, err := session.server.ListenPacket("udp", net.JoinHostPort(src.String(), "0"))
 	if err != nil {
 		return nil, err
 	}
 	if pc == nil {
 		return nil, errors.New("packetConn is nil")
 	}
-	return newPacketConn(pc, t), nil
+	return NewPacketConn(pc, t), nil
+}
+
+// Tailnet DNS answers public names only through an exit node or a global
+// nameserver, so a public name pointing into the tailnet may be unknown to
+// it. Such a host is reached at the address the rules resolved, or, without
+// an exit node, at DIRECT's answer when tailnet DNS has none.
+func (t *Tailscale) routedAddr(ctx context.Context, metadata *C.Metadata) (netip.Addr, bool) {
+	routes := tailnet.Lookup(t.Name())
+	if metadata.Host == "" || routes == nil || routes.MatchHost(metadata.Host) {
+		return netip.Addr{}, false
+	}
+	if routes.Contains(metadata.DstIP) {
+		return metadata.DstIP, true
+	}
+	if t.HasExitNode() {
+		return netip.Addr{}, false
+	}
+	if _, err := resolveIPWithResolver(ctx, metadata.Host, t.prefer, t.dnsResolver); err == nil {
+		return netip.Addr{}, false
+	}
+	addrs, err := resolver.LookupIPWithResolver(ctx, metadata.Host, resolver.DirectHostResolver)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	for _, addr := range addrs {
+		if routes.Contains(addr) {
+			return addr.Unmap(), true
+		}
+	}
+	return netip.Addr{}, false
 }
 
 func (t *Tailscale) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
+	if addr, ok := t.routedAddr(ctx, metadata); ok {
+		metadata.DstIP = addr
+		return nil
+	}
 	if metadata.Host != "" {
 		ip, err := resolveIPWithResolver(ctx, metadata.Host, t.prefer, t.dnsResolver)
 		if err != nil {
@@ -427,7 +659,8 @@ func (t tailscaleDNSTransport) ExchangeContext(ctx context.Context, msg *D.Msg) 
 	if len(msg.Question) == 0 {
 		return nil, errors.New("should have one question at least")
 	}
-	if err := t.tailscale.ensureStarted(ctx); err != nil {
+	session, err := t.tailscale.ensureStarted(ctx)
+	if err != nil {
 		return nil, err
 	}
 	q := msg.Question[0]
@@ -435,7 +668,7 @@ func (t tailscaleDNSTransport) ExchangeContext(ctx context.Context, msg *D.Msg) 
 	if !ok {
 		return nil, fmt.Errorf("unsupported query type: %d", q.Qtype)
 	}
-	lc, err := t.tailscale.server.LocalClient()
+	lc, err := session.server.LocalClient()
 	if err != nil {
 		return nil, err
 	}
@@ -461,16 +694,15 @@ func (t *Tailscale) IsL3Protocol(metadata *C.Metadata) bool {
 	return true
 }
 
+// Close releases the pooled session; it stops only when no newer outbound
+// picks it up within the linger period.
 func (t *Tailscale) Close() error {
 	t.cancel()
-	if t.unregisterDNSResolver != nil {
-		t.unregisterDNSResolver()
-	}
-	t.startOnce.Do(func() {
-		t.startErr = errors.New("tailscale outbound closed")
-	})
-	if t.server != nil && t.serverStarted { // tsnet.Server.Close() must not be called before or concurrently with Start.
-		return t.server.Close()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.closed {
+		t.closed = true
+		t.releaseLocked()
 	}
 	return nil
 }

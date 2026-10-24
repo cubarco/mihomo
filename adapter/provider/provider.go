@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/adapter"
@@ -44,11 +45,12 @@ type providerForApi struct {
 }
 
 type baseProvider struct {
-	mutex       sync.RWMutex
-	name        string
-	proxies     []C.Proxy
-	healthCheck *HealthCheck
-	version     uint32
+	mappingSchema *proxyProviderSchema
+	mutex         sync.RWMutex
+	name          string
+	proxies       []C.Proxy
+	healthCheck   *HealthCheck
+	version       uint32
 }
 
 func (bp *baseProvider) Name() string {
@@ -70,6 +72,10 @@ func (bp *baseProvider) Initial() error {
 
 func (bp *baseProvider) HealthCheck() {
 	bp.healthCheck.check()
+}
+
+func (bp *baseProvider) HealthCheckBackground() {
+	bp.healthCheck.checkBackground(healthCheckRecovery)
 }
 
 func (bp *baseProvider) Type() P.ProviderType {
@@ -107,7 +113,7 @@ func (bp *baseProvider) setProxies(proxies []C.Proxy) {
 	bp.version += 1
 	bp.healthCheck.setProxies(proxies)
 	if bp.healthCheck.auto() {
-		go bp.healthCheck.check()
+		go bp.healthCheck.checkScheduled()
 	}
 }
 
@@ -124,11 +130,15 @@ type ProxySetProvider struct {
 type proxySetProvider struct {
 	baseProvider
 	*resource.Fetcher[[]C.Proxy]
-	subscriptionInfo *SubscriptionInfo
+	subscriptionInfo atomic.Pointer[SubscriptionInfo]
 }
 
 func (pp *proxySetProvider) MarshalJSON() ([]byte, error) {
-	return json.Marshal(providerForApi{
+	return json.Marshal(pp.apiSnapshot())
+}
+
+func (pp *proxySetProvider) apiSnapshot() providerForApi {
+	return providerForApi{
 		Name:             pp.Name(),
 		Type:             pp.Type().String(),
 		VehicleType:      pp.VehicleType().String(),
@@ -136,8 +146,8 @@ func (pp *proxySetProvider) MarshalJSON() ([]byte, error) {
 		TestUrl:          pp.healthCheck.url,
 		ExpectedStatus:   pp.healthCheck.expectedStatus.String(),
 		UpdatedAt:        pp.UpdatedAt(),
-		SubscriptionInfo: pp.subscriptionInfo,
-	})
+		SubscriptionInfo: pp.subscriptionInfo.Load(),
+	}
 }
 
 func (pp *proxySetProvider) Name() string {
@@ -158,7 +168,7 @@ func (pp *proxySetProvider) Initial() error {
 		return err
 	}
 	if subscriptionInfo := cachefile.Cache().GetSubscriptionInfo(pp.Name()); subscriptionInfo != "" {
-		pp.subscriptionInfo = NewSubscriptionInfo(subscriptionInfo)
+		pp.subscriptionInfo.Store(NewSubscriptionInfo(subscriptionInfo))
 	}
 	pp.closeAllConnections()
 	return nil
@@ -206,12 +216,17 @@ func NewProxySetProvider(name string, interval time.Duration, payload []map[stri
 	}
 
 	fetcher := resource.NewFetcher[[]C.Proxy](name, interval, vehicle, nil, parser, pd.setProxies)
+	fetcher.SetDiscard(func(proxies []C.Proxy) {
+		for _, proxy := range proxies {
+			_ = proxy.Close()
+		}
+	})
 	pd.Fetcher = fetcher
 	if httpVehicle, ok := vehicle.(*resource.HTTPVehicle); ok {
 		httpVehicle.SetInRead(func(resp *http.Response) {
 			if subscriptionInfo := resp.Header.Get("subscription-userinfo"); subscriptionInfo != "" {
 				cachefile.Cache().SetSubscriptionInfo(name, subscriptionInfo)
-				pd.subscriptionInfo = NewSubscriptionInfo(subscriptionInfo)
+				pd.subscriptionInfo.Store(NewSubscriptionInfo(subscriptionInfo))
 			}
 		})
 	}
@@ -237,15 +252,21 @@ type inlineProvider struct {
 }
 
 func (ip *inlineProvider) MarshalJSON() ([]byte, error) {
-	return json.Marshal(providerForApi{
+	return json.Marshal(ip.apiSnapshot())
+}
+
+func (ip *inlineProvider) apiSnapshot() providerForApi {
+	ip.mutex.RLock()
+	defer ip.mutex.RUnlock()
+	return providerForApi{
 		Name:           ip.Name(),
 		Type:           ip.Type().String(),
 		VehicleType:    ip.VehicleType().String(),
-		Proxies:        ip.Proxies(),
+		Proxies:        ip.proxies,
 		TestUrl:        ip.healthCheck.url,
 		ExpectedStatus: ip.healthCheck.expectedStatus.String(),
 		UpdatedAt:      ip.updateAt,
-	})
+	}
 }
 
 func (ip *inlineProvider) VehicleType() P.VehicleType {
@@ -254,7 +275,9 @@ func (ip *inlineProvider) VehicleType() P.VehicleType {
 
 func (ip *inlineProvider) Update() error {
 	// make api update happy
+	ip.mutex.Lock()
 	ip.updateAt = time.Now()
+	ip.mutex.Unlock()
 	return nil
 }
 
@@ -299,14 +322,18 @@ type compatibleProvider struct {
 }
 
 func (cp *compatibleProvider) MarshalJSON() ([]byte, error) {
-	return json.Marshal(providerForApi{
+	return json.Marshal(cp.apiSnapshot())
+}
+
+func (cp *compatibleProvider) apiSnapshot() providerForApi {
+	return providerForApi{
 		Name:           cp.Name(),
 		Type:           cp.Type().String(),
 		VehicleType:    cp.VehicleType().String(),
 		Proxies:        cp.Proxies(),
 		TestUrl:        cp.healthCheck.url,
 		ExpectedStatus: cp.healthCheck.expectedStatus.String(),
-	})
+	}
 }
 
 func (cp *compatibleProvider) Update() error {
@@ -341,6 +368,11 @@ func (cp *CompatibleProvider) Close() error {
 }
 
 func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilter string, excludeType string, dialerProxy string, override overrideSchema, ageSecretKey string) (resource.Parser[[]C.Proxy], error) {
+	for _, rename := range override.ProxyName {
+		if rename.Pattern == nil || rename.Pattern.Regexp == nil {
+			return nil, errors.New("proxy name replacement requires a pattern")
+		}
+	}
 	var excludeTypeArray []string
 	if excludeType != "" {
 		excludeTypeArray = strings.Split(excludeType, "|")
@@ -349,7 +381,7 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 	var excludeFilterRegs []*regexp2.Regexp
 	if excludeFilter != "" {
 		for _, excludeFilter := range strings.Split(excludeFilter, "`") {
-			excludeFilterReg, err := regexp2.Compile(excludeFilter, regexp2.None)
+			excludeFilterReg, err := utils.CompileNameRegex(excludeFilter)
 			if err != nil {
 				return nil, fmt.Errorf("invalid excludeFilter regex: %w", err)
 			}
@@ -359,7 +391,7 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 
 	var filterRegs []*regexp2.Regexp
 	for _, filter := range strings.Split(filter, "`") {
-		filterReg, err := regexp2.Compile(filter, regexp2.None)
+		filterReg, err := utils.CompileNameRegex(filter)
 		if err != nil {
 			return nil, fmt.Errorf("invalid filter regex: %w", err)
 		}
@@ -394,6 +426,14 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 		}
 
 		proxies := []C.Proxy{}
+		parsed := false
+		defer func() {
+			if !parsed {
+				for _, proxy := range proxies {
+					_ = proxy.Close()
+				}
+			}
+		}()
 		proxiesSet := map[string]struct{}{}
 		for _, filterReg := range filterRegs {
 		LOOP1:
@@ -423,13 +463,21 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 				}
 				if len(excludeFilterRegs) > 0 {
 					for _, excludeFilterReg := range excludeFilterRegs {
-						if mat, _ := excludeFilterReg.MatchString(name); mat {
+						mat, err := excludeFilterReg.MatchString(name)
+						if err != nil {
+							return nil, fmt.Errorf("exclude-filter evaluation failed: %w", err)
+						}
+						if mat {
 							continue LOOP1
 						}
 					}
 				}
 				if len(filter) > 0 {
-					if mat, _ := filterReg.MatchString(name); !mat {
+					mat, err := filterReg.MatchString(name)
+					if err != nil {
+						return nil, fmt.Errorf("filter evaluation failed: %w", err)
+					}
+					if !mat {
 						continue
 					}
 				}
@@ -463,6 +511,7 @@ func NewProxiesParser(pdName string, tunnel C.Tunnel, filter string, excludeFilt
 			return nil, errors.New("file doesn't have any proxy")
 		}
 
+		parsed = true
 		return proxies, nil
 	}, nil
 }

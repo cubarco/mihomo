@@ -2,6 +2,7 @@ package route
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,15 +34,30 @@ import (
 var (
 	uiPath = ""
 
-	httpServer *http.Server
-	tlsServer  *http.Server
-	unixServer *http.Server
-	pipeServer *http.Server
+	serverMu   sync.Mutex
+	httpServer *controllerServer
+	tlsServer  *controllerServer
+	unixServer *controllerServer
+	pipeServer *controllerServer
 
 	embedMode = false
 )
 
+type controllerServer struct {
+	*http.Server
+	listener net.Listener
+}
+
+func (server *controllerServer) Close() error {
+	err := server.Server.Close()
+	// Serve may not have registered the listener before the next configuration.
+	_ = server.listener.Close()
+	return err
+}
+
 func SetEmbedMode(embed bool) {
+	serverMu.Lock()
+	defer serverMu.Unlock()
 	embedMode = embed
 }
 
@@ -61,6 +78,7 @@ type Config struct {
 	TLSAddr        string
 	UnixAddr       string
 	PipeAddr       string
+	RoutingMark    int
 	Secret         string
 	Certificate    string
 	PrivateKey     string
@@ -88,15 +106,19 @@ func (c Cors) Apply(r chi.Router) {
 }
 
 func ReCreateServer(cfg *Config) {
-	go start(cfg)
-	go startTLS(cfg)
-	go startUnix(cfg)
+	serverMu.Lock()
+	defer serverMu.Unlock()
+	start(cfg)
+	startTLS(cfg)
+	startUnix(cfg)
 	if inbound.SupportNamedPipe {
-		go startPipe(cfg)
+		startPipe(cfg)
 	}
 }
 
 func SetUIPath(path string) {
+	serverMu.Lock()
+	defer serverMu.Unlock()
 	uiPath = C.Path.Resolve(path)
 }
 
@@ -166,20 +188,21 @@ func start(cfg *Config) {
 
 	// handle addr
 	if len(cfg.Addr) > 0 {
-		l, err := inbound.Listen("tcp", cfg.Addr)
+		lc := inbound.NewListenConfig()
+		lc.SetRouteMark(cfg.RoutingMark)
+		l, err := lc.Listen(context.Background(), "tcp", cfg.Addr)
 		if err != nil {
 			log.Errorln("External controller listen error: %s", err)
 			return
 		}
 		log.Infoln("RESTful API listening at: %s", l.Addr().String())
 
-		server := &http.Server{
-			Handler: router(cfg.IsDebug, cfg.Secret, cfg.DohServer, cfg.Cors),
+		server := &controllerServer{
+			Server:   &http.Server{Handler: router(cfg.IsDebug, cfg.Secret, cfg.DohServer, cfg.Cors)},
+			listener: l,
 		}
 		httpServer = server
-		if err = server.Serve(l); err != nil {
-			log.Errorln("External controller serve error: %s", err)
-		}
+		go func() { _ = server.Serve(l) }()
 	}
 }
 
@@ -198,13 +221,6 @@ func startTLS(cfg *Config) {
 			return
 		}
 
-		l, err := inbound.Listen("tcp", cfg.TLSAddr)
-		if err != nil {
-			log.Errorln("External controller tls listen error: %s", err)
-			return
-		}
-
-		log.Infoln("RESTful API tls listening at: %s", l.Addr().String())
 		tlsConfig := &tls.Config{Time: ntp.Now}
 		tlsConfig.NextProtos = []string{"h2", "http/1.1"}
 		tlsConfig.GetCertificate = func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -232,13 +248,26 @@ func startTLS(cfg *Config) {
 				return
 			}
 		}
-		server := &http.Server{
-			Handler: router(cfg.IsDebug, cfg.Secret, cfg.DohServer, cfg.Cors),
+		lc := inbound.NewListenConfig()
+		lc.SetRouteMark(cfg.RoutingMark)
+		l, err := lc.Listen(context.Background(), "tcp", cfg.TLSAddr)
+		if err != nil {
+			log.Errorln("External controller tls listen error: %s", err)
+			return
+		}
+
+		log.Infoln("RESTful API tls listening at: %s", l.Addr().String())
+		tlsListener := tls.NewListener(l, tlsConfig)
+		server := &controllerServer{
+			Server:   &http.Server{Handler: router(cfg.IsDebug, cfg.Secret, cfg.DohServer, cfg.Cors)},
+			listener: tlsListener,
 		}
 		tlsServer = server
-		if err = server.Serve(tls.NewListener(l, tlsConfig)); err != nil {
-			log.Errorln("External controller tls serve error: %s", err)
-		}
+		go func() {
+			if err := server.Serve(tlsListener); err != nil && err != http.ErrServerClosed {
+				log.Errorln("External controller tls serve error: %s", err)
+			}
+		}()
 	}
 }
 
@@ -270,7 +299,9 @@ func startUnix(cfg *Config) {
 		// should be used to delete the socket file prior to calling bind with the same path.
 		_ = syscall.Unlink(addr)
 
-		l, err := inbound.Listen("unix", addr)
+		lc := inbound.NewListenConfig()
+		lc.SetRouteMark(0) // don't set route mark for unix socket
+		l, err := lc.Listen(context.Background(), "unix", addr)
 		if err != nil {
 			log.Errorln("External controller unix listen error: %s", err)
 			return
@@ -278,13 +309,16 @@ func startUnix(cfg *Config) {
 		_ = os.Chmod(addr, 0o666)
 		log.Infoln("RESTful API unix listening at: %s", l.Addr().String())
 
-		server := &http.Server{
-			Handler: router(cfg.IsDebug, "", cfg.DohServer, cfg.Cors),
+		server := &controllerServer{
+			Server:   &http.Server{Handler: router(cfg.IsDebug, "", cfg.DohServer, cfg.Cors)},
+			listener: l,
 		}
 		unixServer = server
-		if err = server.Serve(l); err != nil {
-			log.Errorln("External controller unix serve error: %s", err)
-		}
+		go func() {
+			if err := server.Serve(l); err != nil && err != http.ErrServerClosed {
+				log.Errorln("External controller unix serve error: %s", err)
+			}
+		}()
 	}
 }
 
@@ -309,13 +343,16 @@ func startPipe(cfg *Config) {
 		}
 		log.Infoln("RESTful API pipe listening at: %s", l.Addr().String())
 
-		server := &http.Server{
-			Handler: router(cfg.IsDebug, "", cfg.DohServer, cfg.Cors),
+		server := &controllerServer{
+			Server:   &http.Server{Handler: router(cfg.IsDebug, "", cfg.DohServer, cfg.Cors)},
+			listener: l,
 		}
 		pipeServer = server
-		if err = server.Serve(l); err != nil {
-			log.Errorln("External controller pipe serve error: %s", err)
-		}
+		go func() {
+			if err := server.Serve(l); err != nil && err != http.ErrServerClosed {
+				log.Errorln("External controller pipe serve error: %s", err)
+			}
+		}()
 	}
 }
 

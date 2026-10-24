@@ -16,10 +16,16 @@ type Pool struct {
 	pool           *pool.Pool[*pooledEntry]
 	factory        func(context.Context) (*Snell, error)
 	maxUsesPerConn int
+	closed         atomic.Bool
+	// idleAge is how long a connection may wait in the pool.
+	idleAge time.Duration
 }
 
 func (p *Pool) Warm(ctx context.Context, count int) {
 	for range count {
+		if p.closed.Load() {
+			return
+		}
 		conn, err := p.factory(ctx)
 		if err != nil {
 			return
@@ -34,11 +40,15 @@ const (
 	poolConnClosedBeforeReuse
 
 	defaultMaxUsesPerConn = 2
+	defaultIdleAge        = 15 * time.Second
 )
 
 type pooledEntry struct {
 	conn *Snell
 	uses int
+	// idle watches a connection that waited in the pool; nil for one the
+	// factory dialed for this request.
+	idle *idleConn
 }
 
 func (p *Pool) Get() (net.Conn, error) {
@@ -46,13 +56,40 @@ func (p *Pool) Get() (net.Conn, error) {
 }
 
 func (p *Pool) GetContext(ctx context.Context) (net.Conn, error) {
-	entry, err := p.pool.GetContext(ctx)
+	for {
+		// A canceled request closes the connection it takes before using it.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		entry, err := p.pool.GetContext(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if entry.idle != nil && !entry.idle.claim() {
+			// The server closed it while it waited; the watch already closed it.
+			_ = entry.conn.Close()
+			continue
+		}
+
+		entry.uses++
+		return &PoolConn{Snell: entry.conn, pool: p, uses: entry.uses, reused: entry.idle != nil}, nil
+	}
+}
+
+// Dial opens a connection for one request without taking an idle one.
+func (p *Pool) Dial(ctx context.Context) (*PoolConn, error) {
+	if p.closed.Load() {
+		return nil, pool.ErrClosed
+	}
+	conn, err := p.factory(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	entry.uses++
-	return &PoolConn{Snell: entry.conn, pool: p, uses: entry.uses}, nil
+	if p.closed.Load() {
+		_ = conn.Close()
+		return nil, pool.ErrClosed
+	}
+	return &PoolConn{Snell: conn, pool: p, uses: 1}, nil
 }
 
 func (p *Pool) Put(conn *Snell) {
@@ -69,10 +106,17 @@ func (p *Pool) put(conn *Snell, uses int) {
 		_ = conn.Close()
 		return
 	}
-	p.pool.Put(&pooledEntry{conn: conn, uses: uses})
+	idle, ok := conn.Conn.(*idleConn)
+	if !ok {
+		idle = &idleConn{Conn: conn.Conn}
+		conn.Conn = idle
+	}
+	idle.park(p.idleAge)
+	p.pool.Put(&pooledEntry{conn: conn, uses: uses, idle: idle})
 }
 
 func (p *Pool) Close() error {
+	p.closed.Store(true)
 	return p.pool.Close()
 }
 
@@ -80,6 +124,7 @@ type PoolConn struct {
 	*Snell
 	pool           *Pool
 	uses           int
+	reused         bool
 	closeWriteOnce sync.Once
 	closeWriteErr  error
 	requestStarted atomic.Bool
@@ -104,6 +149,12 @@ func (pc *PoolConn) Write(b []byte) (int, error) {
 		pc.requestStarted.Store(true)
 	}
 	return n, err
+}
+
+// Reused reports whether the connection waited idle in the pool before this
+// request, rather than being dialed for it.
+func (pc *PoolConn) Reused() bool {
+	return pc.reused
 }
 
 func (pc *PoolConn) MarkReusable() {
@@ -145,13 +196,14 @@ func (pc *PoolConn) Close() error {
 		// reset it before reuse connection to avoid io timeout error.
 		_ = pc.Snell.Conn.SetReadDeadline(time.Time{})
 		pc.Snell.reply = false
+		pc.Snell.answered.Store(false)
 		pc.pool.put(pc.Snell, pc.uses)
 	})
 	return pc.closeErr
 }
 
 func NewPool(factory func(context.Context) (*Snell, error)) *Pool {
-	p := &Pool{factory: factory, maxUsesPerConn: defaultMaxUsesPerConn}
+	p := &Pool{factory: factory, maxUsesPerConn: defaultMaxUsesPerConn, idleAge: defaultIdleAge}
 	p.pool = pool.New[*pooledEntry](
 		func(ctx context.Context) (*pooledEntry, error) {
 			conn, err := factory(ctx)
@@ -160,7 +212,7 @@ func NewPool(factory func(context.Context) (*Snell, error)) *Pool {
 			}
 			return &pooledEntry{conn: conn}, nil
 		},
-		pool.WithAge[*pooledEntry](15000),
+		pool.WithAge[*pooledEntry](defaultIdleAge.Milliseconds()),
 		pool.WithSize[*pooledEntry](10),
 		pool.WithEvict[*pooledEntry](func(item *pooledEntry) {
 			_ = item.conn.Close()
@@ -168,4 +220,115 @@ func NewPool(factory func(context.Context) (*Snell, error)) *Pool {
 	)
 
 	return p
+}
+
+// idleConn keeps one Read in flight on a pooled connection, as net/http's
+// persistConn does. A server that closes the connection while it waits in the
+// pool (restart, drain, idle timeout) is noticed at once instead of failing the
+// next request, and once the connection is taken that same Read serves the
+// reply. Nothing is in flight on an idle connection, so any byte, EOF or error
+// read while idle ends it. A connection nobody takes within the pool's age is
+// closed by a timer: the pool itself only evicts when something asks it for one.
+type idleConn struct {
+	net.Conn
+	mu      sync.Mutex
+	idle    bool
+	dead    bool
+	pending chan struct{} // closed when the parked Read returns; nil when none is in flight
+	parked  []byte        // what the parked Read got, served by the next Read
+	err     error
+	expiry  *time.Timer
+	parkGen uint64 // voids an expiry that fired for an earlier park
+}
+
+func (c *idleConn) park(maxAge time.Duration) {
+	c.mu.Lock()
+	if c.dead || c.pending != nil || len(c.parked) > 0 || c.err != nil {
+		// A connection with an unread result cannot be idle.
+		c.dead = true
+		c.mu.Unlock()
+		_ = c.Conn.Close()
+		return
+	}
+	c.idle = true
+	done := make(chan struct{})
+	c.pending = done
+	c.parkGen++
+	if maxAge > 0 {
+		gen := c.parkGen
+		c.expiry = time.AfterFunc(maxAge, func() { c.expire(gen) })
+	}
+	c.mu.Unlock()
+
+	go func() {
+		buf := make([]byte, 1)
+		n, err := c.Conn.Read(buf)
+		c.mu.Lock()
+		c.pending = nil
+		if c.expiry != nil {
+			c.expiry.Stop()
+			c.expiry = nil
+		}
+		idle := c.idle
+		if idle {
+			c.dead = true
+		} else {
+			c.parked = buf[:n]
+			c.err = err
+		}
+		c.mu.Unlock()
+		close(done)
+		if idle {
+			_ = c.Conn.Close()
+		}
+	}()
+}
+
+func (c *idleConn) expire(gen uint64) {
+	c.mu.Lock()
+	if !c.idle || c.dead || c.parkGen != gen {
+		c.mu.Unlock()
+		return
+	}
+	c.dead = true
+	c.mu.Unlock()
+	_ = c.Conn.Close()
+}
+
+// claim takes the connection out of the pool; false once it closed while idle.
+func (c *idleConn) claim() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.dead {
+		return false
+	}
+	c.idle = false
+	if c.expiry != nil {
+		c.expiry.Stop()
+		c.expiry = nil
+	}
+	return true
+}
+
+func (c *idleConn) Read(b []byte) (int, error) {
+	c.mu.Lock()
+	done := c.pending
+	c.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+
+	c.mu.Lock()
+	if len(c.parked) > 0 || c.err != nil {
+		n := copy(b, c.parked)
+		c.parked = c.parked[n:]
+		var err error
+		if len(c.parked) == 0 {
+			err, c.err = c.err, nil
+		}
+		c.mu.Unlock()
+		return n, err
+	}
+	c.mu.Unlock()
+	return c.Conn.Read(b)
 }

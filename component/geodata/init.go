@@ -3,12 +3,12 @@ package geodata
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
+	"github.com/metacubex/mihomo/common/utils"
 	mihomoHttp "github.com/metacubex/mihomo/component/http"
 	"github.com/metacubex/mihomo/component/mmdb"
 	C "github.com/metacubex/mihomo/constant"
@@ -30,61 +30,60 @@ var (
 	geoSiteEnable atomic.Bool
 	asnEnable     atomic.Bool
 
-	geoIpUrl   string
-	mmdbUrl    string
-	geoSiteUrl string
-	asnUrl     string
+	geoIpUrl   atomic.TypedValue[string]
+	mmdbUrl    atomic.TypedValue[string]
+	geoSiteUrl atomic.TypedValue[string]
+	asnUrl     atomic.TypedValue[string]
 )
 
 func GeoIpUrl() string {
-	return geoIpUrl
+	return geoIpUrl.Load()
 }
 
 func SetGeoIpUrl(url string) {
-	geoIpUrl = url
+	geoIpUrl.Store(url)
 }
 
 func MmdbUrl() string {
-	return mmdbUrl
+	return mmdbUrl.Load()
 }
 
 func SetMmdbUrl(url string) {
-	mmdbUrl = url
+	mmdbUrl.Store(url)
 }
 
 func GeoSiteUrl() string {
-	return geoSiteUrl
+	return geoSiteUrl.Load()
 }
 
 func SetGeoSiteUrl(url string) {
-	geoSiteUrl = url
+	geoSiteUrl.Store(url)
 }
 
 func ASNUrl() string {
-	return asnUrl
+	return asnUrl.Load()
 }
 
 func SetASNUrl(url string) {
-	asnUrl = url
+	asnUrl.Store(url)
 }
 
 func downloadToPath(url string, path string) (err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*90)
 	defer cancel()
-	resp, err := mihomoHttp.HttpRequest(ctx, url, http.MethodGet, nil, nil)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+	_, data, err := mihomoHttp.Get(ctx, url, nil, 0, func(_ *http.Response, data []byte) error {
+		if path == C.Path.MMDB() || path == C.Path.ASN() {
+			return VerifyMMDBBytes(data)
+		}
+		if path == C.Path.GeoSite() {
+			return VerifyGeoSiteBytes(data)
+		}
+		return VerifyGeoIPBytes(data)
+	}, mihomoHttp.WithPublicRead())
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
-
-	return err
+	return utils.WriteFileAtomic(ctx, path, data, 0o644)
 }
 
 func InitGeoSite() error {

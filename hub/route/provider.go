@@ -38,15 +38,12 @@ func proxyProviderProxyRouter() http.Handler {
 }
 
 func getProviders(w http.ResponseWriter, r *http.Request) {
-	providers := tunnel.Providers()
-	render.JSON(w, r, render.M{
-		"providers": providers,
-	})
+	writeProvidersJSON(w, r, tunnel.Providers())
 }
 
 func getProvider(w http.ResponseWriter, r *http.Request) {
 	provider := r.Context().Value(CtxKeyProvider).(P.ProxyProvider)
-	render.JSON(w, r, provider)
+	writeProviderJSON(w, r, provider)
 }
 
 func updateProvider(w http.ResponseWriter, r *http.Request) {

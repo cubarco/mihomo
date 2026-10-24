@@ -28,6 +28,8 @@ import (
 	icontext "github.com/metacubex/mihomo/context"
 	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/tunnel/statistic"
+
+	"golang.org/x/exp/slices"
 )
 
 const (
@@ -229,6 +231,7 @@ func UpdateProxies(newProxies map[string]C.Proxy, newProviders map[string]P.Prox
 	configMux.Lock()
 	proxies = newProxies
 	providers = newProviders
+	invalidateAllProxies()
 	configMux.Unlock()
 }
 
@@ -252,7 +255,11 @@ func Mode() TunnelMode {
 
 // SetMode change the mode of tunnel
 func SetMode(m TunnelMode) {
+	changed := mode != m
 	mode = m
+	if changed && ModeChangeHook != nil {
+		ModeChangeHook(m)
+	}
 }
 
 func FindProcessMode() process.FindProcessMode {
@@ -312,17 +319,42 @@ func preHandleMetadata(metadata *C.Metadata) error {
 	return nil
 }
 
-func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
-	if metadata.SpecialProxy != "" {
-		var exist bool
-		proxy, exist = proxies[metadata.SpecialProxy]
-		if !exist {
-			err = fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
+func lookupProcess(metadata *C.Metadata) string {
+	if !features.Android {
+		// normal check for process
+		info, err := process.FindProcessInfo(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
+		if err != nil {
+			log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
+		} else {
+			metadata.Process = filepath.Base(info.Path)
+			metadata.ProcessPath = info.Path
+			metadata.Uid = info.UID
+
+			if pkg, err := process.FindPackageName(metadata); err == nil { // for android (not CMFA) package names
+				metadata.Process = pkg
+			}
+			return interpretedBittorrentClient(info.Path, info.Arguments, runtime.GOOS)
 		}
-		return
+	} else {
+		// check package names
+		pkg, err := process.FindPackageName(metadata)
+		if err != nil {
+			log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
+		} else {
+			metadata.Process = pkg
+		}
 	}
+	return ""
+}
+
+func resolveMetadata(metadata *C.Metadata) (C.Proxy, C.Rule, error) {
+	return resolveMetadataWithProcess(metadata, lookupProcess, runtime.GOOS)
+}
+
+func resolveMetadataWithProcess(metadata *C.Metadata, findProcess func(*C.Metadata) string, goos string) (proxy C.Proxy, rule C.Rule, err error) {
 	var (
 		resolved             bool
+		processClient        string
 		attemptProcessLookup = metadata.Type != C.INNER
 	)
 
@@ -334,7 +366,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 	helper := C.RuleMatchHelper{
 		ResolveIP: func() {
 			if !resolved && metadata.Host != "" && !metadata.Resolved() {
-				ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
+				ctx, cancel := context.WithTimeout(resolver.WithInitiator(context.Background(), resolver.InitiatorRule), resolver.DefaultDNSTimeout)
 				defer cancel()
 				ip, err := resolver.ResolveIP(ctx, metadata.Host)
 				if err != nil {
@@ -349,29 +381,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		FindProcess: func() {
 			if attemptProcessLookup {
 				attemptProcessLookup = false
-				if !features.CMFA {
-					// normal check for process
-					uid, path, err := process.FindProcessName(metadata.NetWork.String(), metadata.SrcIP, int(metadata.SrcPort))
-					if err != nil {
-						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
-					} else {
-						metadata.Process = filepath.Base(path)
-						metadata.ProcessPath = path
-						metadata.Uid = uid
-
-						if pkg, err := process.FindPackageName(metadata); err == nil { // for android (not CMFA) package names
-							metadata.Process = pkg
-						}
-					}
-				} else {
-					// check package names
-					pkg, err := process.FindPackageName(metadata)
-					if err != nil {
-						log.Debugln("[Process] find process error for %s: %v", metadata.String(), err)
-					} else {
-						metadata.Process = pkg
-					}
-				}
+				processClient = findProcess(metadata)
 			}
 		},
 		CheckPassRule: func(adapterName string) bool {
@@ -386,6 +396,31 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 			}
 			return false
 		},
+	}
+
+	if canForceProcessDirect(metadata, goos) && downloadClients.needsLookup(metadata) {
+		originalProcess, originalPath, originalUID := metadata.Process, metadata.ProcessPath, metadata.Uid
+		helper.FindProcess()
+		processName := strings.ToLower(metadata.Process)
+		if processClient != "" {
+			processName = processClient
+		}
+		if directRule := bittorrentDirectRules[processName]; directRule != nil {
+			downloadClients.seen()
+			return proxies["DIRECT"], directRule, nil
+		}
+		if FindProcessMode() == process.FindProcessOff {
+			metadata.Process, metadata.ProcessPath, metadata.Uid = originalProcess, originalPath, originalUID
+		}
+	}
+
+	if metadata.SpecialProxy != "" {
+		var exist bool
+		proxy, exist = proxies[metadata.SpecialProxy]
+		if !exist {
+			err = fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
+		}
+		return
 	}
 
 	switch FindProcessMode() {
@@ -436,14 +471,18 @@ func handleUDPConn(packet C.PacketAdapter) {
 	}
 
 	key := packet.Key()
+	var diagnostic *udpSessionDiagnostic
 	sender, loaded := natTable.GetOrCreate(key, func() C.PacketSender {
-		sender := newPacketSender()
+		diagnostic = udpDiagnostics.begin(key)
+		sender := newPacketSender(diagnostic)
 		if sniffingEnable && snifferDispatcher.Enable() {
 			return snifferDispatcher.UDPSniff(packet, sender)
 		}
 		return sender
 	})
 	if !loaded {
+		diagnostic.created()
+		stage := "sniff"
 		dial := func() (C.PacketConn, C.WriteBackProxy, error) {
 			originMetadata := metadata  // save origin metadata
 			metadata = metadata.Clone() // don't modify PacketAdapter's metadata
@@ -455,6 +494,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 
 			_ = preHandleMetadata(metadata) // error was pre-checked
 
+			stage = "route"
 			proxy, rule, err := resolveMetadata(metadata)
 			if err != nil {
 				log.Warnln("[UDP] Parse metadata failed: %s", err.Error())
@@ -464,6 +504,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 			dialMetadata := metadata.Pure()
 			ctx, cancel := context.WithTimeout(context.Background(), C.DefaultUDPTimeout)
 			defer cancel()
+			stage = "dial"
 			rawPc, err := retry(ctx, func(ctx context.Context) (C.PacketConn, error) {
 				return proxy.ListenPacketContext(ctx, dialMetadata)
 			}, func(err error) {
@@ -480,7 +521,8 @@ func handleUDPConn(packet C.PacketAdapter) {
 			oAddrPort := dialMetadata.AddrPort()
 			writeBackProxy := nat.NewWriteBackProxy(packet)
 
-			go handleUDPToLocal(writeBackProxy, pc, sender, key, oAddrPort)
+			diagnostic.ready(pc.ID())
+			go handleUDPToLocal(writeBackProxy, pc, sender, key, oAddrPort, diagnostic)
 			return pc, writeBackProxy, nil
 		}
 
@@ -488,6 +530,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 			pc, proxy, err := dial()
 			if err != nil {
 				sender.Close()
+				diagnostic.ended(stage, err)
 				natTable.Delete(key)
 				return
 			}
@@ -649,40 +692,168 @@ func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
 	}
 }
 
+type resolvedClaim struct {
+	rule      C.Rule
+	owner     C.Rule
+	matchAddr func(netip.Addr) bool
+}
+
+// directLookup resolves as DIRECT's own dial would, so the dial reuses it.
+var directLookup = func(ctx context.Context, host string) (netip.Addr, error) {
+	return resolver.ResolveIPWithResolver(resolver.WithInitiator(ctx, resolver.InitiatorDirect), host, resolver.DirectHostResolver)
+}
+
+func dialsDirect(proxy C.Proxy, metadata *C.Metadata) bool {
+	for adapter := proxy; adapter != nil; adapter = adapter.Unwrap(metadata, false) {
+		if adapter.Type() == C.Direct {
+			return true
+		}
+	}
+	return false
+}
+
+func passesOn(proxy C.Proxy, metadata *C.Metadata) bool {
+	for adapter := proxy; adapter != nil; adapter = adapter.Unwrap(metadata, false) {
+		if adapter.Type() == C.Pass || adapter.Type() == C.Rematch {
+			return true
+		}
+	}
+	return false
+}
+
+// pendingDirectClaims settles the claims on a host that goes DIRECT with the
+// address DIRECT's own resolver gives it.
+type pendingDirectClaims func(addr netip.Addr) (C.Proxy, C.Rule, bool)
+
 func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, error) {
+	proxy, rule, pending, err := matchRules(metadata, helper)
+	if err != nil || pending == nil {
+		return proxy, rule, err
+	}
+	// Resolved outside configMux, so a slow answer cannot hold up a config
+	// apply; DIRECT reuses the cached answer when it dials.
+	ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
+	addr, lookupErr := directLookup(ctx, metadata.Host)
+	cancel()
+	if lookupErr == nil {
+		if claimed, claimRule, ok := pending(addr); ok {
+			metadata.DstIP = addr
+			return claimed, claimRule, nil
+		}
+	}
+	return proxy, rule, nil
+}
+
+func matchRules(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, pendingDirectClaims, error) {
 	configMux.RLock()
 	defer configMux.RUnlock()
 
-	for _, rule := range getRules(metadata) {
-		if matched, ada := rule.Match(metadata, helper); matched {
-			adapter, ok := proxies[ada]
-			if !ok {
-				continue
-			}
-
-			// parse multi-layer nesting
-			passed := false
-			for adapter := adapter; adapter != nil; adapter = adapter.Unwrap(metadata, false) {
-				if adapter.Type() == C.Pass {
-					passed = true
-					break
-				}
-			}
-			if passed {
-				log.Debugln("%s match Pass rule", adapter.Name())
-				continue
-			}
-
-			if metadata.NetWork == C.UDP && !adapter.SupportUDP() {
-				log.Debugln("%s UDP is not supported", adapter.Name())
-				continue
-			}
-
-			return adapter, rule, nil
+	// Maps are replaced, never written in place, so a pending claim may read
+	// this one after the lock is released.
+	table := proxies
+	var (
+		claims  []resolvedClaim
+		current C.Rule
+	)
+	helper.ClaimResolved = func(rule C.Rule, matchAddr func(netip.Addr) bool) {
+		// A nested rule without a target of its own can never take the host.
+		if _, ok := table[rule.Adapter()]; ok {
+			claims = append(claims, resolvedClaim{rule: rule, owner: current, matchAddr: matchAddr})
 		}
 	}
+	// Claims are settled once, by the first address the host resolves to.
+	settle := func(addr netip.Addr) (C.Proxy, C.Rule, bool) {
+		pending := claims
+		claims = nil
+		for _, claim := range pending {
+			if !claim.matchAddr(addr) {
+				continue
+			}
+			adapter := table[claim.rule.Adapter()]
+			if (metadata.NetWork == C.UDP && !adapter.SupportUDP()) || passesOn(adapter, metadata) {
+				continue
+			}
+			if wrapper, ok := claim.owner.(C.RuleWrapper); ok && wrapper.Unwrap() == claim.rule {
+				if counter, ok := wrapper.(interface{ Claimed() }); ok {
+					counter.Claimed()
+				}
+				return adapter, wrapper, true
+			}
+			return adapter, claim.rule, true
+		}
+		return nil, nil, false
+	}
+	// DIRECT resolves the host anyway, so the caller looks it up the same way
+	// and settles the claims without an extra query or touching unclaimed
+	// metadata.
+	finish := func(adapter C.Proxy, rule C.Rule) (C.Proxy, C.Rule, pendingDirectClaims, error) {
+		if len(claims) > 0 && !metadata.Resolved() && metadata.Host != "" && dialsDirect(adapter, metadata) {
+			return adapter, rule, settle, nil
+		}
+		return adapter, rule, nil, nil
+	}
 
-	return proxies["DIRECT"], nil, nil
+	var rematchChain []string
+	for {
+		var rematchProxy C.Proxy
+		var rematchRule C.Rule
+		claims = nil
+	GetRules:
+		for _, rule := range getRules(metadata) {
+			current = rule
+			matched, ada := rule.Match(metadata, helper)
+			if len(claims) > 0 && metadata.Resolved() {
+				if claimed, claimRule, ok := settle(metadata.DstIP); ok {
+					return claimed, claimRule, nil, nil
+				}
+			}
+			if matched {
+				adapter, ok := proxies[ada]
+				if !ok {
+					continue
+				}
+
+				// parse multi-layer nesting
+				for adapter := adapter; adapter != nil; adapter = adapter.Unwrap(metadata, false) {
+					if adapter.Type() == C.Pass {
+						log.Debugln("%s match Pass rule", adapter.Name())
+						continue GetRules
+					}
+					if adapter.Type() == C.Rematch {
+						log.Debugln("%s match Rematch rule", adapter.Name())
+						rematchProxy = adapter
+						rematchRule = rule
+						break GetRules
+					}
+				}
+
+				if metadata.NetWork == C.UDP && !adapter.SupportUDP() {
+					log.Debugln("%s UDP is not supported", adapter.Name())
+					continue
+				}
+
+				return finish(adapter, rule)
+			}
+		}
+		if rematchProxy != nil {
+			if slices.Contains(rematchChain, rematchProxy.Name()) {
+				log.Warnln("[Rule] rematch cycle detected on %s", rematchProxy.Name())
+				return rematchProxy, rematchRule, nil, nil
+			}
+			rematchChain = append(rematchChain, rematchProxy.Name())
+			conn, err := rematchProxy.DialContext(context.Background(), metadata) // not a real connection, just for metadata update
+			if conn != nil {
+				_ = conn.Close()
+			}
+			if err != nil {
+				log.Warnln("[Rule] rematch proxy %s failed to update metadata: %s", rematchProxy.Name(), err)
+				return rematchProxy, rematchRule, nil, nil
+			}
+			log.Debugln("[Rule] rematch proxy %s update metadata to rematch-name=%q sub-rule=%q", rematchProxy.Name(), metadata.InName, metadata.SpecialRules)
+			continue
+		}
+		return finish(proxies["DIRECT"], nil)
+	}
 }
 
 func getRules(metadata *C.Metadata) []C.Rule {

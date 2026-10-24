@@ -27,6 +27,7 @@ type Client interface {
 	LastVisited() time.Time
 	SetLastVisited(last time.Time)
 	Close()
+	ForceClose()
 }
 
 type ServerHandler interface {

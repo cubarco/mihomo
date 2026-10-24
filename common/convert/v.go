@@ -44,10 +44,16 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
 		proxy["servername"] = sni
 	}
 	if realityPublicKey := query.Get("pbk"); realityPublicKey != "" {
-		proxy["reality-opts"] = map[string]any{
+		realityOpts := map[string]any{
 			"public-key": realityPublicKey,
 			"short-id":   query.Get("sid"),
 		}
+		if value := query.Get("support-x25519mlkem768"); value != "" {
+			if enabled, err := strconv.ParseBool(value); err == nil {
+				realityOpts["support-x25519mlkem768"] = enabled
+			}
+		}
+		proxy["reality-opts"] = realityOpts
 	}
 
 	switch query.Get("packetEncoding") {
@@ -125,6 +131,11 @@ func handleVShareLink(names map[string]int, url *url.URL, scheme string, proxy m
 		if earlyDataHeader := query.Get("eh"); earlyDataHeader != "" {
 			wsOpts["early-data-header-name"] = earlyDataHeader
 		}
+		// The outbounds only implement HTTPUpgrade as a WebSocket option.
+		if network == "httpupgrade" {
+			proxy["network"] = "ws"
+			wsOpts["v2ray-http-upgrade"] = true
+		}
 
 		proxy["ws-opts"] = wsOpts
 
@@ -190,6 +201,10 @@ func parseXHTTPExtra(extra map[string]any, opts map[string]any) {
 		return reuse
 	}
 
+	if headers, ok := extra["headers"].(map[string]any); ok && len(headers) > 0 {
+		opts["headers"] = headers
+	}
+
 	if v, ok := extra["noGRPCHeader"].(bool); ok && v {
 		opts["no-grpc-header"] = true
 	}
@@ -218,16 +233,32 @@ func parseXHTTPExtra(extra map[string]any, opts map[string]any) {
 		opts["x-padding-method"] = v
 	}
 
-	if v, ok := extra["uplinkHttpMethod"].(string); ok && v != "" {
+	if v, ok := extra["uplinkHTTPMethod"].(string); ok && v != "" {
+		opts["uplink-http-method"] = v
+	} else if v, ok := extra["uplinkHttpMethod"].(string); ok && v != "" {
 		opts["uplink-http-method"] = v
 	}
 
-	if v, ok := extra["sessionPlacement"].(string); ok && v != "" {
+	if v, ok := extra["sessionIDPlacement"].(string); ok && v != "" {
+		opts["session-placement"] = v
+	} else if v, ok := extra["sessionPlacement"].(string); ok && v != "" {
 		opts["session-placement"] = v
 	}
 
-	if v, ok := extra["sessionKey"].(string); ok && v != "" {
+	if v, ok := extra["sessionIDKey"].(string); ok && v != "" {
 		opts["session-key"] = v
+	} else if v, ok := extra["sessionKey"].(string); ok && v != "" {
+		opts["session-key"] = v
+	}
+
+	if v, ok := extra["sessionIDTable"].(string); ok && v != "" {
+		opts["session-table"] = v
+	}
+
+	if v, ok := extra["sessionIDLength"].(string); ok && v != "" {
+		opts["session-length"] = v
+	} else if v, ok := extra["sessionIDLength"].(float64); ok {
+		opts["session-length"] = strconv.FormatInt(int64(v), 10)
 	}
 
 	if v, ok := extra["seqPlacement"].(string); ok && v != "" {
@@ -348,4 +379,69 @@ func parseXHTTPExtra(extra map[string]any, opts map[string]any) {
 			opts["download-settings"] = ds
 		}
 	}
+}
+
+func buildRealmOpts(serverURL, token, realmID string, stunServers []string) map[string]any {
+	opts := map[string]any{"enable": true, "server-url": serverURL}
+	if token != "" {
+		opts["token"] = token
+	}
+	if realmID != "" {
+		opts["realm-id"] = realmID
+	}
+	if len(stunServers) > 0 {
+		opts["stun-servers"] = stunServers
+	}
+	return opts
+}
+
+func SplitHysteria2Ports(line string) (string, string) {
+	i := strings.Index(line, "://")
+	if i < 0 {
+		return line, ""
+	}
+	head, rest := line[:i+3], line[i+3:]
+	auth, tail := rest, ""
+	if j := strings.IndexAny(rest, "/?#"); j >= 0 {
+		auth, tail = rest[:j], rest[j:]
+	}
+	userinfo := ""
+	if at := strings.LastIndex(auth, "@"); at >= 0 {
+		userinfo, auth = auth[:at+1], auth[at+1:]
+	}
+	if strings.Contains(auth, "]") {
+		return line, ""
+	}
+	colon := strings.LastIndex(auth, ":")
+	if colon < 0 {
+		return line, ""
+	}
+	host, ports := auth[:colon], auth[colon+1:]
+	if !strings.ContainsAny(ports, ",-") {
+		return line, ""
+	}
+	// Validate before narrowing the authority to its first port. The outbound's
+	// generic range parser can otherwise truncate values when converting to uint16.
+	for _, span := range strings.Split(ports, ",") {
+		bounds := strings.Split(span, "-")
+		if len(bounds) > 2 {
+			return line, ""
+		}
+		var start uint64
+		for i, bound := range bounds {
+			port, err := strconv.ParseUint(bound, 10, 16)
+			if err != nil || port == 0 || (i == 1 && port < start) {
+				return line, ""
+			}
+			start = port
+		}
+	}
+	first := ports
+	if k := strings.IndexAny(ports, ",-"); k >= 0 {
+		first = ports[:k]
+	}
+	if first == "" {
+		return line, ""
+	}
+	return head + userinfo + host + ":" + first + tail, ports
 }

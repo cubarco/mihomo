@@ -1,6 +1,7 @@
 package inbound
 
 import (
+	"github.com/metacubex/mihomo/listener/restls"
 	"strings"
 
 	C "github.com/metacubex/mihomo/constant"
@@ -22,6 +23,9 @@ type VlessOption struct {
 	ClientAuthCert  string        `inbound:"client-auth-cert,omitempty"`
 	EchKey          string        `inbound:"ech-key,omitempty"`
 	AllowInsecure   bool          `inbound:"allow-insecure,omitempty"`
+	ShadowTLS       ShadowTLS     `inbound:"shadow-tls,omitempty"`
+	ResTLS          ResTLS        `inbound:"res-tls,omitempty"`
+	JLSConfig       JLSConfig     `inbound:"jls-config,omitempty"`
 	RealityConfig   RealityConfig `inbound:"reality-config,omitempty"`
 	MuxOption       MuxOption     `inbound:"mux-option,omitempty"`
 }
@@ -94,6 +98,11 @@ type Vless struct {
 }
 
 func NewVless(options *VlessOption) (*Vless, error) {
+	if options.ResTLS.Enable {
+		if err := restls.Validate(options.ResTLS.Build()); err != nil {
+			return nil, err
+		}
+	}
 	base, err := NewBase(&options.BaseOption)
 	if err != nil {
 		return nil, err
@@ -123,6 +132,9 @@ func NewVless(options *VlessOption) (*Vless, error) {
 			ClientAuthCert:  options.ClientAuthCert,
 			EchKey:          options.EchKey,
 			AllowInsecure:   options.AllowInsecure,
+			ShadowTLS:       options.ShadowTLS.Build(),
+			ResTLS:          options.ResTLS.Build(),
+			JLSConfig:       options.JLSConfig.Build(),
 			RealityConfig:   options.RealityConfig.Build(),
 			MuxOption:       options.MuxOption.Build(),
 		},
@@ -148,8 +160,9 @@ func (v *Vless) Address() string {
 // Listen implements constant.InboundListener
 func (v *Vless) Listen(tunnel C.Tunnel) error {
 	var err error
-	v.l, err = sing_vless.New(v.vs, tunnel, v.Additions()...)
+	v.l, err = sing_vless.New(v.vs, v.ListenConfig(), tunnel, v.Additions()...)
 	if err != nil {
+		v.l = nil
 		return err
 	}
 	log.Infoln("Vless[%s] proxy listening at: %s", v.Name(), v.Address())
@@ -158,6 +171,9 @@ func (v *Vless) Listen(tunnel C.Tunnel) error {
 
 // Close implements constant.InboundListener
 func (v *Vless) Close() error {
+	if v.l == nil {
+		return nil
+	}
 	return v.l.Close()
 }
 

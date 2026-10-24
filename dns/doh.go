@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/component/ca"
+	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 
@@ -35,16 +36,9 @@ const (
 	// connections in HTTP transport.
 	transportDefaultIdleConnTimeout = 5 * time.Minute
 
-	// dohMaxConnsPerHost controls the maximum number of connections for
-	// each host.  Note, that setting it to 1 may cause issues with Go's http
-	// implementation, see https://github.com/AdguardTeam/dnsproxy/issues/278.
-	dohMaxConnsPerHost = 2
-	dialTimeout        = 10 * time.Second
+	dialTimeout = 10 * time.Second
 
-	// dohMaxIdleConns controls the maximum number of connections being idle
-	// at the same time.
-	dohMaxIdleConns = 2
-	maxElapsedTime  = time.Second * 30
+	maxElapsedTime = time.Second * 30
 )
 
 var DefaultHTTPVersions = []C.HTTPVersion{C.HTTPVersion11, C.HTTPVersion2}
@@ -68,13 +62,14 @@ type dnsOverHTTPS struct {
 	dialer         *dnsDialer
 	addr           string
 	skipCertVerify bool
+	nameCertVerify string
 }
 
 // type check
 var _ dnsClient = (*dnsOverHTTPS)(nil)
 
 // newDoH returns the DNS-over-HTTPS Upstream.
-func newDoHClient(urlString string, r *Resolver, preferH3 bool, params map[string]string, proxyAdapter C.ProxyAdapter, proxyName string) dnsClient {
+func newDoHClient(urlString string, r resolver.Resolver, preferH3 bool, params map[string]string, proxyAdapter C.ProxyAdapter, proxyName string) dnsClient {
 	u, _ := url.Parse(urlString)
 	httpVersions := DefaultHTTPVersions
 	if preferH3 {
@@ -99,6 +94,7 @@ func newDoHClient(urlString string, r *Resolver, preferH3 bool, params map[strin
 	if params["skip-cert-verify"] == "true" {
 		doh.skipCertVerify = true
 	}
+	doh.nameCertVerify = params["name-cert-verify"]
 
 	runtime.SetFinalizer(doh, (*dnsOverHTTPS).Close)
 
@@ -387,12 +383,17 @@ func (doh *dnsOverHTTPS) createClient(ctx context.Context) (*http.Client, error)
 // HTTP3 is enabled in the upstream options).  If this attempt is successful,
 // it returns an HTTP3 transport, otherwise it returns the H1/H2 transport.
 func (doh *dnsOverHTTPS) createTransport(ctx context.Context) (t http.RoundTripper, err error) {
+	// http.Transport dials in a context detached from the request, so a dial
+	// that the query has given up on must still end on its own.
 	transport := &http.Transport{
 		DisableCompression: true,
-		DialContext:        doh.dialer.DialContext,
-		IdleConnTimeout:    transportDefaultIdleConnTimeout,
-		MaxConnsPerHost:    dohMaxConnsPerHost,
-		MaxIdleConns:       dohMaxIdleConns,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			ctx, cancel := context.WithTimeout(ctx, dialTimeout)
+			defer cancel()
+			return doh.dialer.DialContext(ctx, network, addr)
+		},
+		IdleConnTimeout:     transportDefaultIdleConnTimeout,
+		TLSHandshakeTimeout: dialTimeout,
 	}
 
 	if doh.url.Scheme == "http" {
@@ -405,6 +406,7 @@ func (doh *dnsOverHTTPS) createTransport(ctx context.Context) (t http.RoundTripp
 			MinVersion:             tls.VersionTLS12,
 			SessionTicketsDisabled: false,
 		},
+		NameCertVerify: doh.nameCertVerify,
 	})
 	if err != nil {
 		return nil, err

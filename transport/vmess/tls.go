@@ -8,14 +8,20 @@ import (
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/ech"
 	tlsC "github.com/metacubex/mihomo/component/tls"
+	"github.com/metacubex/mihomo/transport/jls"
+	"github.com/metacubex/mihomo/transport/restls"
+	"github.com/metacubex/mihomo/transport/shadowtls"
+	"github.com/metacubex/mihomo/transport/tlsmirror"
 
 	"github.com/metacubex/tls"
 	utls "github.com/metacubex/utls"
 )
 
 type TLSConfig struct {
+	Restls               *restls.Config
 	Host                 string
 	SkipCertVerify       bool
+	NameCertVerify       string
 	CAFile               string
 	FingerPrint          string
 	Certificate          string
@@ -27,6 +33,10 @@ type TLSConfig struct {
 	ClientSessionCache   tls.ClientSessionCache
 	UClientSessionCache  utls.ClientSessionCache
 	DisableRenegotiation bool
+	ShadowTLS            *shadowtls.Config
+	JLS                  *jls.Config
+	TLSMirror            *tlsmirror.Config
+	TLSMirrorDialer      tlsmirror.EnrollmentDialer
 }
 
 func (cfg *TLSConfig) ToStdConfig() (*tls.Config, error) {
@@ -37,9 +47,10 @@ func (cfg *TLSConfig) ToStdConfig() (*tls.Config, error) {
 			NextProtos:         cfg.NextProtos,
 			ClientSessionCache: cfg.ClientSessionCache,
 		},
-		Fingerprint: cfg.FingerPrint,
-		Certificate: cfg.Certificate,
-		PrivateKey:  cfg.PrivateKey,
+		Fingerprint:    cfg.FingerPrint,
+		NameCertVerify: cfg.NameCertVerify,
+		Certificate:    cfg.Certificate,
+		PrivateKey:     cfg.PrivateKey,
 	})
 	if err != nil {
 		return nil, err
@@ -50,10 +61,81 @@ func (cfg *TLSConfig) ToStdConfig() (*tls.Config, error) {
 			return nil, err
 		}
 	}
+	if cfg.CAFile != "" && cfg.NameCertVerify != "" && cfg.FingerPrint == "" {
+		ca.SetNameCertVerify(tlsConfig, cfg.NameCertVerify)
+	}
 	return tlsConfig, nil
 }
 
 func StreamTLSConn(ctx context.Context, conn net.Conn, cfg *TLSConfig) (net.Conn, error) {
+	if cfg.ShadowTLS != nil {
+		alpn := cfg.NextProtos
+		if alpn == nil {
+			alpn = shadowtls.DefaultALPN
+		}
+		return shadowtls.NewShadowTLS(ctx, conn, &shadowtls.ShadowTLSOption{
+			Password:          cfg.ShadowTLS.Password,
+			Host:              cfg.Host,
+			Fingerprint:       cfg.FingerPrint,
+			Certificate:       cfg.Certificate,
+			PrivateKey:        cfg.PrivateKey,
+			ClientFingerprint: cfg.ClientFingerprint,
+			SkipCertVerify:    cfg.SkipCertVerify,
+			NameCertVerify:    cfg.NameCertVerify,
+			Version:           cfg.ShadowTLS.Version,
+			ALPN:              alpn,
+		})
+	}
+	if cfg.Restls != nil {
+		if cfg.Reality != nil || cfg.ECH != nil || cfg.Certificate != "" || cfg.PrivateKey != "" {
+			return nil, errors.New("Restls does not support REALITY, ECH or client certificates")
+		}
+		config := cfg.Restls.Clone()
+		config.ServerName = cfg.Host
+		config.NextProtos = cfg.NextProtos
+		config.InsecureSkipVerify = cfg.SkipCertVerify
+		if cfg.CAFile != "" {
+			pool, err := ca.LoadCertificates(cfg.CAFile)
+			if err != nil {
+				return nil, err
+			}
+			config.RootCAs = pool
+		}
+		if cfg.FingerPrint != "" {
+			if err := restls.SetFingerprint(config, cfg.FingerPrint, cfg.NameCertVerify); err != nil {
+				return nil, err
+			}
+		}
+		if cfg.FingerPrint == "" && cfg.NameCertVerify != "" {
+			restls.SetNameCertVerify(config, cfg.NameCertVerify)
+		}
+		return restls.NewRestls(ctx, conn, config)
+	}
+	if cfg.JLS != nil {
+		return jls.NewClient(ctx, conn, &jls.ClientConfig{
+			Config:            *cfg.JLS,
+			ServerName:        cfg.Host,
+			ALPN:              cfg.NextProtos,
+			ClientFingerprint: cfg.ClientFingerprint,
+		})
+	}
+	if cfg.TLSMirror != nil {
+		return tlsmirror.Dial(ctx, conn, tlsmirror.ClientConfig{
+			Config:             *cfg.TLSMirror,
+			ServerName:         cfg.Host,
+			SkipCertVerify:     cfg.SkipCertVerify,
+			NameCertVerify:     cfg.NameCertVerify,
+			ALPN:               cfg.NextProtos,
+			Fingerprint:        cfg.FingerPrint,
+			Certificate:        cfg.Certificate,
+			PrivateKey:         cfg.PrivateKey,
+			ClientFingerprint:  cfg.ClientFingerprint,
+			ForwardAddressHint: cfg.Host,
+			ECH:                cfg.ECH,
+			EnrollmentDialer:   cfg.TLSMirrorDialer,
+		})
+	}
+
 	tlsConfig, err := cfg.ToStdConfig()
 	if err != nil {
 		return nil, err
@@ -95,6 +177,7 @@ func StreamTLSConn(ctx context.Context, conn net.Conn, cfg *TLSConfig) (net.Conn
 		return nil, err
 	}
 
+	tlsConfig.ClientSessionCache = sharedTLSSessions.forConfig(cfg, tlsConfig, conn.RemoteAddr())
 	tlsConn := tls.Client(conn, tlsConfig)
 
 	err = tlsConn.HandshakeContext(ctx)

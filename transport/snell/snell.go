@@ -8,8 +8,8 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 
-	"github.com/metacubex/blake3"
 	"github.com/metacubex/mihomo/common/pool"
 	"github.com/metacubex/mihomo/transport/shadowsocks/shadowaead"
 	"github.com/metacubex/mihomo/transport/socks5"
@@ -21,6 +21,7 @@ const (
 	Version3            = 3
 	Version4            = 4
 	Version5            = 5
+	Version6            = 6
 	DefaultSnellVersion = Version1
 
 	// max packet length
@@ -41,11 +42,6 @@ const (
 	Version byte = 1
 )
 
-const (
-	IdentityHeaderLength = 16
-	identityWireMagic    = "DLSNID01"
-)
-
 var endSignal = []byte{}
 
 type packetFrameWriter interface {
@@ -56,6 +52,14 @@ type Snell struct {
 	net.Conn
 	buffer [1]byte
 	reply  bool
+	// answered mirrors reply for the writing goroutine: set once the server
+	// answers the current request, an error reply included.
+	answered atomic.Bool
+}
+
+// Answered reports whether the server has answered the current request.
+func (s *Snell) Answered() bool {
+	return s.answered.Load()
 }
 
 func (s *Snell) Read(b []byte) (int, error) {
@@ -74,6 +78,7 @@ func (s *Snell) ReadReply() error {
 		return err
 	}
 	s.reply = true
+	s.answered.Store(true)
 
 	if s.buffer[0] == CommandTunnel {
 		return nil
@@ -169,33 +174,27 @@ func HalfClose(conn net.Conn) error {
 	}
 	if s, ok := conn.(*Snell); ok {
 		s.reply = false
+		s.answered.Store(false)
 	}
 	return nil
 }
 
-func IdentityHeaderFromPSK(psk []byte) []byte {
-	hash := blake3.Sum512(psk)
-	return append([]byte(nil), hash[:IdentityHeaderLength]...)
-}
-
-func StreamConnWithIdentity(conn net.Conn, psk []byte, version int) *Snell {
-	return streamConn(conn, psk, version, IdentityHeaderFromPSK(psk))
-}
-
 func StreamConnWithExporterIdentity(conn net.Conn, psk []byte, version int, exporter []byte) *Snell {
+	if version == Version6 {
+		return &Snell{Conn: newV6Conn(conn, psk, exporter)}
+	}
 	if version >= Version4 {
 		return &Snell{Conn: newV4ConnWithExporterIdentity(conn, psk, exporter)}
 	}
-	return StreamConnWithIdentity(conn, psk, version)
+	return StreamConn(conn, psk, version)
 }
 
 func StreamConn(conn net.Conn, psk []byte, version int) *Snell {
-	return streamConn(conn, psk, version, nil)
-}
-
-func streamConn(conn net.Conn, psk []byte, version int, identity []byte) *Snell {
+	if version == Version6 {
+		return &Snell{Conn: newV6Conn(conn, psk, nil)}
+	}
 	if version >= Version4 {
-		return &Snell{Conn: newV4ConnWithIdentity(conn, psk, identity)}
+		return &Snell{Conn: newV4Conn(conn, psk)}
 	}
 
 	var cipher shadowaead.Cipher

@@ -4,6 +4,7 @@ import (
 	"net/netip"
 
 	"github.com/metacubex/mihomo/component/profile/cachefile"
+	"github.com/metacubex/mihomo/log"
 )
 
 type cachefileStore struct {
@@ -15,24 +16,15 @@ func (c *cachefileStore) GetByHost(host string) (netip.Addr, bool) {
 	return c.cache.GetByHost(host)
 }
 
-// PutByHost implements store.PutByHost
-func (c *cachefileStore) PutByHost(host string, ip netip.Addr) {
-	c.cache.PutByHost(host, ip)
-}
-
 // GetByIP implements store.GetByIP
 func (c *cachefileStore) GetByIP(ip netip.Addr) (string, bool) {
 	return c.cache.GetByIP(ip)
 }
 
-// PutByIP implements store.PutByIP
-func (c *cachefileStore) PutByIP(ip netip.Addr, host string) {
-	c.cache.PutByIP(ip, host)
-}
-
-// DelByIP implements store.DelByIP
-func (c *cachefileStore) DelByIP(ip netip.Addr) {
-	c.cache.DelByIP(ip)
+func (c *cachefileStore) PutMapping(host string, ip netip.Addr) {
+	if err := c.cache.PutMapping(host, ip); err != nil {
+		log.Warnln("[CacheFile] write cache to %s failed: %s", c.cache.DB.Path(), err.Error())
+	}
 }
 
 // Exist implements store.Exist

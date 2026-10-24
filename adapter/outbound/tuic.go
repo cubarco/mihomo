@@ -2,10 +2,12 @@ package outbound
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
 	"math"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/metacubex/mihomo/component/ca"
@@ -26,6 +28,8 @@ type Tuic struct {
 	option *TuicOption
 	client *tuic.PoolClient
 
+	configOnce sync.Once
+	rootCAs    *x509.CertPool
 	quicConfig *quic.Config
 	tlsConfig  *tls.Config
 	echConfig  *ech.Config
@@ -54,6 +58,7 @@ type TuicOption struct {
 	CWND                 int        `proxy:"cwnd,omitempty"`
 	BBRProfile           string     `proxy:"bbr-profile,omitempty"`
 	SkipCertVerify       bool       `proxy:"skip-cert-verify,omitempty"`
+	NameCertVerify       string     `proxy:"name-cert-verify,omitempty"`
 	Fingerprint          string     `proxy:"fingerprint,omitempty"`
 	Certificate          string     `proxy:"certificate,omitempty"`
 	PrivateKey           string     `proxy:"private-key,omitempty"`
@@ -97,25 +102,31 @@ func (t *Tuic) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_
 
 		destination := M.SocksaddrFromNet(metadata.UDPAddr())
 		if t.option.UDPOverStreamVersion == uot.LegacyVersion {
-			return newPacketConn(uot.NewConn(c, uot.Request{Destination: destination}), t), nil
+			return NewPacketConn(uot.NewConn(c, uot.Request{Destination: destination}), t), nil
 		} else {
-			return newPacketConn(uot.NewLazyConn(c, uot.Request{Destination: destination}), t), nil
+			return NewPacketConn(uot.NewLazyConn(c, uot.Request{Destination: destination}), t), nil
 		}
 	}
 	pc, err := t.client.ListenPacket(ctx, metadata)
 	if err != nil {
 		return nil, err
 	}
-	return newPacketConn(pc, t), nil
+	return NewPacketConn(pc, t), nil
 }
 
 func (t *Tuic) dial(ctx context.Context) (quicConn *quic.Conn, err error) {
-	_, quicConn, err = common.DialQuic(ctx, t.addr, t.DialOptions(), t.dialer, t.tlsConfig, t.quicConfig, t.option.ReduceRtt)
+	tlsConfig, quicConfig := t.dialConfigs()
+	_, quicConn, err = common.DialQuic(ctx, t.addr, t.DialOptions(), t.dialer, tlsConfig, quicConfig, common.DialQuicOption{Early: t.option.ReduceRtt})
 	if err != nil {
 		return nil, err
 	}
 	common.SetCongestionController(quicConn, t.option.CongestionController, t.option.CWND, t.option.BBRProfile)
 	return quicConn, nil
+}
+
+func (t *Tuic) Close() error {
+	t.client.Close()
+	return nil
 }
 
 // ProxyInfo implements C.ProxyAdapter
@@ -127,29 +138,22 @@ func (t *Tuic) ProxyInfo() C.ProxyInfo {
 
 func NewTuic(option TuicOption) (*Tuic, error) {
 	addr := net.JoinHostPort(option.Server, strconv.Itoa(option.Port))
-	serverName := option.Server
-	if option.SNI != "" {
-		serverName = option.SNI
-	}
-
-	tlsConfig, err := ca.GetTLSConfig(ca.Option{
-		TLSConfig: &tls.Config{
-			ServerName:         serverName,
-			InsecureSkipVerify: option.SkipCertVerify,
-			MinVersion:         tls.VersionTLS13,
-		},
-		Fingerprint: option.Fingerprint,
-		Certificate: option.Certificate,
-		PrivateKey:  option.PrivateKey,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	if option.ALPN != nil { // structure's Decode will ensure value not nil when input has value even it was set an empty array
-		tlsConfig.NextProtos = option.ALPN
+	var tlsConfig *tls.Config
+	var rootCAs *x509.CertPool
+	if option.Fingerprint != "" || option.NameCertVerify != "" || option.Certificate != "" || option.PrivateKey != "" {
+		var err error
+		tlsConfig, err = ca.GetTLSConfig(ca.Option{
+			TLSConfig:      newTuicTLSConfig(&option),
+			Fingerprint:    option.Fingerprint,
+			NameCertVerify: option.NameCertVerify,
+			Certificate:    option.Certificate,
+			PrivateKey:     option.PrivateKey,
+		})
+		if err != nil {
+			return nil, err
+		}
 	} else {
-		tlsConfig.NextProtos = []string{"h3"}
+		rootCAs = ca.GetCertPool()
 	}
 
 	if option.RequestTimeout == 0 {
@@ -191,36 +195,8 @@ func NewTuic(option TuicOption) (*Tuic, error) {
 	}
 	option.MaxUdpRelayPacketSize = option.MaxDatagramFrameSize - packetOverHead
 
-	// ensure server's incoming stream can handle correctly, increase to 1.1x
-	quicMaxOpenStreams := int64(option.MaxOpenStreams)
-	quicMaxOpenStreams = quicMaxOpenStreams + int64(math.Ceil(float64(quicMaxOpenStreams)/10.0))
-	quicConfig := &quic.Config{
-		InitialStreamReceiveWindow:     uint64(option.ReceiveWindowConn),
-		MaxStreamReceiveWindow:         uint64(option.ReceiveWindowConn),
-		InitialConnectionReceiveWindow: uint64(option.ReceiveWindow),
-		MaxConnectionReceiveWindow:     uint64(option.ReceiveWindow),
-		MaxIncomingStreams:             quicMaxOpenStreams,
-		MaxIncomingUniStreams:          quicMaxOpenStreams,
-		KeepAlivePeriod:                time.Duration(option.HeartbeatInterval) * time.Millisecond,
-		DisablePathMTUDiscovery:        option.DisableMTUDiscovery,
-		MaxDatagramFrameSize:           int64(option.MaxDatagramFrameSize),
-		EnableDatagrams:                true,
-	}
-	if option.ReceiveWindowConn == 0 {
-		quicConfig.InitialStreamReceiveWindow = tuic.DefaultStreamReceiveWindow / 10
-		quicConfig.MaxStreamReceiveWindow = tuic.DefaultStreamReceiveWindow
-	}
-	if option.ReceiveWindow == 0 {
-		quicConfig.InitialConnectionReceiveWindow = tuic.DefaultConnectionReceiveWindow / 10
-		quicConfig.MaxConnectionReceiveWindow = tuic.DefaultConnectionReceiveWindow
-	}
-
 	if len(option.Ip) > 0 {
 		addr = net.JoinHostPort(option.Ip, strconv.Itoa(option.Port))
-	}
-	if option.DisableSni {
-		tlsConfig.ServerName = ""
-		tlsConfig.InsecureSkipVerify = true // tls: either ServerName or InsecureSkipVerify must be specified in the tls.Config
 	}
 
 	echConfig, err := option.ECHOpts.Parse()
@@ -248,10 +224,10 @@ func NewTuic(option TuicOption) (*Tuic, error) {
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
 		}),
-		option:     &option,
-		quicConfig: quicConfig,
-		tlsConfig:  tlsConfig,
-		echConfig:  echConfig,
+		option:    &option,
+		rootCAs:   rootCAs,
+		tlsConfig: tlsConfig,
+		echConfig: echConfig,
 	}
 	t.dialer = option.NewDialer(t.DialOptions())
 

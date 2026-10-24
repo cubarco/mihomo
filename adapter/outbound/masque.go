@@ -19,7 +19,6 @@ import (
 	"github.com/metacubex/mihomo/common/contextutils"
 	"github.com/metacubex/mihomo/common/pool"
 	"github.com/metacubex/mihomo/component/dialer"
-	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/log"
@@ -28,48 +27,56 @@ import (
 
 	"github.com/metacubex/http"
 	"github.com/metacubex/quic-go"
-	wireguard "github.com/metacubex/sing-wireguard"
-	M "github.com/metacubex/sing/common/metadata"
 	"github.com/metacubex/tls"
+	"golang.org/x/sync/semaphore"
 )
 
 type Masque struct {
 	*Base
 	tlsConfig   *tls.Config
 	quicConfig  *quic.Config
-	tunDevice   wireguard.Device
-	resolver    resolver.Resolver
+	tunDevice   ipStack
+	resolver    *nodeDNS
 	uri         string
 	h2Transport *http.Transport
+	l4Client    *masque.L4Client
 
 	runCtx    context.Context
 	runCancel context.CancelFunc
-	runMutex  sync.Mutex
+	runLock   *semaphore.Weighted
 	running   atomic.Bool
-	runDevice atomic.Bool
+
+	deviceMutex   sync.Mutex
+	localPrefixes []netip.Prefix
+	runDevice     bool
+	closeOnce     sync.Once
 
 	option MasqueOption
 }
 
 type MasqueOption struct {
 	BasicOption
-	Name           string `proxy:"name"`
-	Server         string `proxy:"server"`
-	Port           int    `proxy:"port"`
-	PrivateKey     string `proxy:"private-key"`
-	PublicKey      string `proxy:"public-key"`
-	Ip             string `proxy:"ip,omitempty"`
-	Ipv6           string `proxy:"ipv6,omitempty"`
-	URI            string `proxy:"uri,omitempty"`
-	SNI            string `proxy:"sni,omitempty"`
-	MTU            int    `proxy:"mtu,omitempty"`
-	UDP            bool   `proxy:"udp,omitempty"`
-	SkipCertVerify bool   `proxy:"skip-cert-verify,omitempty"`
-	Network        string `proxy:"network,omitempty"`
+	Name             string `proxy:"name"`
+	Server           string `proxy:"server"`
+	Port             int    `proxy:"port"`
+	PrivateKey       string `proxy:"private-key"`
+	PublicKey        string `proxy:"public-key"`
+	Ip               string `proxy:"ip,omitempty"`
+	Ipv6             string `proxy:"ipv6,omitempty"`
+	URI              string `proxy:"uri,omitempty"`
+	SNI              string `proxy:"sni,omitempty"`
+	MTU              int    `proxy:"mtu,omitempty"`
+	UDP              bool   `proxy:"udp,omitempty"`
+	HandshakeTimeout int    `proxy:"handshake-timeout,omitempty"`
+	SkipCertVerify   bool   `proxy:"skip-cert-verify,omitempty"`
+	NameCertVerify   string `proxy:"name-cert-verify,omitempty"` // placeholder; MASQUE does not verify certificate names
+	Network          string `proxy:"network,omitempty"`
 
 	CongestionController string `proxy:"congestion-controller,omitempty"`
 	CWND                 int    `proxy:"cwnd,omitempty"`
 	BBRProfile           string `proxy:"bbr-profile,omitempty"`
+
+	IPStack IPStackOption `proxy:"ip-stack,omitempty"`
 
 	RemoteDnsResolve bool     `proxy:"remote-dns-resolve,omitempty"`
 	Dns              []string `proxy:"dns,omitempty"`
@@ -103,7 +110,14 @@ func (option MasqueOption) Prefixes() ([]netip.Prefix, error) {
 	return localPrefixes, nil
 }
 
-func NewMasque(option MasqueOption) (*Masque, error) {
+func NewMasque(option MasqueOption) (_ *Masque, resultErr error) {
+	if option.HandshakeTimeout < 0 {
+		return nil, errors.New("masque handshake timeout must be non-negative")
+	}
+	option.IPStack.normalize()
+	if err := option.IPStack.validate(); err != nil {
+		return nil, err
+	}
 	outbound := &Masque{
 		Base: NewBase(BaseOption{
 			Name:         option.Name,
@@ -115,12 +129,18 @@ func NewMasque(option MasqueOption) (*Masque, error) {
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
 		}),
+		runLock: semaphore.NewWeighted(1),
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	outbound.runCtx = ctx
 	outbound.runCancel = cancel
+	defer func() {
+		if resultErr != nil {
+			_ = outbound.Close()
+		}
+	}()
 
 	privKeyB64, err := base64.StdEncoding.DecodeString(option.PrivateKey)
 	if err != nil {
@@ -144,6 +164,8 @@ func NewMasque(option MasqueOption) (*Masque, error) {
 		return nil, fmt.Errorf("failed to assert public key as ECDSA")
 	}
 
+	l4proxy := option.Network == "h3-l4proxy"
+
 	uri := option.URI
 	if uri == "" {
 		uri = masque.ConnectURI
@@ -153,6 +175,9 @@ func NewMasque(option MasqueOption) (*Masque, error) {
 	sni := option.SNI
 	if sni == "" {
 		sni = masque.ConnectSNI
+		if l4proxy {
+			sni = masque.L4ConnectSNI
+		}
 	}
 
 	tlsConfig, err := masque.PrepareTlsConfig(privKey, ecPubKey, sni, option.SkipCertVerify)
@@ -197,30 +222,41 @@ func NewMasque(option MasqueOption) (*Masque, error) {
 		KeepAlivePeriod:   30 * time.Second,
 	}
 
-	prefixes, err := option.Prefixes()
-	if err != nil {
-		return nil, err
+	if option.MTU == 0 {
+		option.MTU = 1280
 	}
-
 	outbound.option = option
 
-	mtu := option.MTU
-	if mtu == 0 {
-		mtu = 1280
-	}
-	if len(prefixes) == 0 {
-		return nil, errors.New("missing local address")
-	}
-	outbound.tunDevice, err = wireguard.NewStackDevice(prefixes, uint32(mtu))
-	if err != nil {
-		return nil, fmt.Errorf("create device: %w", err)
-	}
-
 	var has6 bool
-	for _, address := range prefixes {
-		if !address.Addr().Unmap().Is4() {
-			has6 = true
-			break
+	if l4proxy {
+		outbound.l4Client = masque.NewL4Client(outbound.runCtx, outbound.dialQuic)
+		if outbound.udp {
+			log.Warnln("[Masque](%s) L4 proxy mode is not supported for UDP", outbound.name)
+			outbound.udp = false
+		}
+		has6 = true // l4 proxy mode always has ipv6
+	} else {
+		prefixes, err := option.Prefixes()
+		if err != nil {
+			return nil, err
+		}
+		if len(prefixes) == 0 {
+			return nil, errors.New("missing local address")
+		}
+		outbound.localPrefixes = prefixes
+		if ipStackNeedsEagerValidation(prefixes, uint32(option.MTU)) {
+			device, err := newIPStack(option.IPStack, prefixes, uint32(option.MTU))
+			if err != nil {
+				return nil, fmt.Errorf("create device: %w", err)
+			}
+			outbound.tunDevice = device
+		}
+
+		for _, address := range prefixes {
+			if !address.Addr().Unmap().Is4() {
+				has6 = true
+				break
+			}
 		}
 	}
 
@@ -232,21 +268,46 @@ func NewMasque(option MasqueOption) (*Masque, error) {
 		for i := range nss {
 			nss[i].ProxyAdapter = outbound
 		}
-		outbound.resolver = dns.NewResolver(dns.Config{
-			Main: nss,
-			IPv6: has6,
-		})
+		outbound.resolver = &nodeDNS{servers: nss, ipv6: has6}
 	}
 
 	return outbound, nil
 }
 
+func (w *Masque) dialQuic(ctx context.Context) (net.PacketConn, *quic.Conn, error) {
+	// without ConnectionIDLength set, backend occasionally throws PROTOCOL_VIOLATION and that closes our connection
+	pc, quicConn, err := common.DialQuic(ctx, w.addr, w.DialOptions(), w.dialer, w.tlsConfig, w.quicConfig, common.DialQuicOption{ConnectionIDLength: 20})
+	if err != nil {
+		return nil, nil, err
+	}
+	common.SetCongestionController(quicConn, w.option.CongestionController, w.option.CWND, w.option.BBRProfile)
+	return pc, quicConn, nil
+}
+
 func (w *Masque) run(ctx context.Context) error {
+	if err := w.runCtx.Err(); err != nil {
+		return err
+	}
 	if w.running.Load() {
 		return nil
 	}
-	w.runMutex.Lock()
-	defer w.runMutex.Unlock()
+	runCtx, cancel := context.WithCancel(ctx)
+	stop := contextutils.AfterFunc(w.runCtx, cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
+
+	if err := w.runLock.Acquire(runCtx, 1); err != nil {
+		return err
+	}
+	releaseRunLock := true
+	defer func() {
+		if releaseRunLock {
+			w.runLock.Release(1)
+		}
+	}()
+
 	// double-check like sync.Once
 	if w.running.Load() {
 		return nil
@@ -256,12 +317,33 @@ func (w *Masque) run(ctx context.Context) error {
 		return w.runCtx.Err()
 	}
 
-	if !w.runDevice.Load() {
-		err := w.tunDevice.Start()
-		if err != nil {
+	if w.option.HandshakeTimeout > 0 {
+		resultCh := make(chan error, 1)
+		releaseRunLock = false
+		go func() {
+			defer w.runLock.Release(1)
+
+			handshakeTimeout := time.Duration(w.option.HandshakeTimeout) * time.Second
+			handshakeCtx, handshakeCancel := context.WithTimeout(w.runCtx, handshakeTimeout)
+			defer handshakeCancel()
+
+			resultCh <- w.startLocked(handshakeCtx)
+		}()
+
+		select {
+		case err := <-resultCh:
 			return err
+		case <-runCtx.Done():
+			return runCtx.Err()
 		}
-		w.runDevice.Store(true)
+	}
+
+	return w.startLocked(runCtx)
+}
+
+func (w *Masque) startLocked(ctx context.Context) error {
+	if err := w.startDevice(ctx); err != nil {
+		return err
 	}
 
 	var pc net.PacketConn
@@ -275,11 +357,10 @@ func (w *Masque) run(ctx context.Context) error {
 		}
 	} else {
 		var quicConn *quic.Conn
-		pc, quicConn, err = common.DialQuic(ctx, w.addr, w.DialOptions(), w.dialer, w.tlsConfig, w.quicConfig, false)
+		pc, quicConn, err = w.dialQuic(ctx)
 		if err != nil {
 			return err
 		}
-		common.SetCongestionController(quicConn, w.option.CongestionController, w.option.CWND, w.option.BBRProfile)
 
 		closer, ipConn, err = masque.ConnectTunnel(ctx, quicConn, w.uri)
 		if err != nil {
@@ -354,29 +435,66 @@ func (w *Masque) run(ctx context.Context) error {
 
 // Close implements C.ProxyAdapter
 func (w *Masque) Close() error {
-	w.runCancel()
-	if w.tunDevice != nil {
-		w.tunDevice.Close()
-	}
+	w.closeOnce.Do(func() {
+		w.runCancel()
+		w.resolver.close()
+		w.deviceMutex.Lock()
+		if w.tunDevice != nil {
+			_ = w.tunDevice.Close()
+		}
+		w.deviceMutex.Unlock()
+		if w.l4Client != nil {
+			_ = w.l4Client.Close()
+		}
+		if w.h2Transport != nil {
+			w.h2Transport.CloseIdleConnections()
+		}
+	})
 	return nil
 }
 
+func (w *Masque) dialContextL4(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
+	var conn net.Conn
+	if !metadata.Resolved() || w.resolver != nil {
+		r, resolveErr := w.resolver.get(ctx)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		options := w.DialOptions()
+		options = append(options, dialer.WithResolver(r))
+		options = append(options, dialer.WithNetDialer(w.l4Client))
+		conn, err = dialer.NewDialer(options...).DialContext(ctx, "tcp", metadata.RemoteAddress())
+	} else {
+		conn, err = w.l4Client.DialContext(ctx, "tcp", metadata.AddrPort().String())
+	}
+	if err != nil {
+		return nil, err
+	}
+	if conn == nil {
+		return nil, errors.New("conn is nil")
+	}
+	return NewConn(conn, w), nil
+}
+
 func (w *Masque) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Conn, err error) {
+	if w.l4Client != nil {
+		return w.dialContextL4(ctx, metadata)
+	}
 	var conn net.Conn
 	if err = w.run(ctx); err != nil {
 		return nil, err
 	}
 	if !metadata.Resolved() || w.resolver != nil {
-		r := resolver.DefaultResolver
-		if w.resolver != nil {
-			r = w.resolver
+		r, resolveErr := w.resolver.get(ctx)
+		if resolveErr != nil {
+			return nil, resolveErr
 		}
 		options := w.DialOptions()
 		options = append(options, dialer.WithResolver(r))
-		options = append(options, dialer.WithNetDialer(wgNetDialer{tunDevice: w.tunDevice}))
+		options = append(options, dialer.WithNetDialer(ipStackNetDialer{stack: w.tunDevice}))
 		conn, err = dialer.NewDialer(options...).DialContext(ctx, "tcp", metadata.RemoteAddress())
 	} else {
-		conn, err = w.tunDevice.DialContext(ctx, "tcp", M.SocksaddrFrom(metadata.DstIP, metadata.DstPort).Unwrap())
+		conn, err = w.tunDevice.DialTCP(ctx, "tcp", netip.AddrPort{}, metadata.AddrPort())
 	}
 	if err != nil {
 		return nil, err
@@ -388,6 +506,9 @@ func (w *Masque) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Con
 }
 
 func (w *Masque) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (_ C.PacketConn, err error) {
+	if w.l4Client != nil {
+		return nil, errors.New("masque L4 proxy mode is not supported for UDP")
+	}
 	var pc net.PacketConn
 	if err = w.run(ctx); err != nil {
 		return nil, err
@@ -395,21 +516,22 @@ func (w *Masque) ListenPacketContext(ctx context.Context, metadata *C.Metadata) 
 	if err = w.ResolveUDP(ctx, metadata); err != nil {
 		return nil, err
 	}
-	pc, err = w.tunDevice.ListenPacket(ctx, M.SocksaddrFrom(metadata.DstIP, metadata.DstPort).Unwrap())
+	// The ipStack contract guarantees that a generic UDP wildcard supports both address families.
+	pc, err = w.tunDevice.ListenUDP(ctx, "udp", netip.AddrPort{})
 	if err != nil {
 		return nil, err
 	}
 	if pc == nil {
 		return nil, errors.New("packetConn is nil")
 	}
-	return newPacketConn(pc, w), nil
+	return NewPacketConn(pc, w), nil
 }
 
 func (w *Masque) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
 	if (!metadata.Resolved() || w.resolver != nil) && metadata.Host != "" {
-		r := resolver.DefaultResolver
-		if w.resolver != nil {
-			r = w.resolver
+		r, err := w.resolver.get(ctx)
+		if err != nil {
+			return err
 		}
 		ip, err := resolveIPWithResolver(ctx, metadata.Host, w.prefer, r)
 		if err != nil {

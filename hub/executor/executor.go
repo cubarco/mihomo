@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -31,6 +32,7 @@ import (
 	"github.com/metacubex/mihomo/component/updater"
 	"github.com/metacubex/mihomo/config"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/constant/features"
 	P "github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/listener"
@@ -103,8 +105,9 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateSniffer(cfg.Sniffer)
 	updateHosts(cfg.Hosts)
 	updateGeneral(cfg.General, true)
-	updateNTP(cfg.NTP)
 	updateDNS(cfg.DNS, cfg.General.IPv6)
+	// NTP resolves its server as soon as it starts, so install DNS first.
+	updateNTP(cfg.NTP)
 	updateListeners(cfg.General, cfg.Listeners, force)
 	updateTun(cfg.General) // tun should not care "force"
 	updateIPTables(cfg)
@@ -116,7 +119,14 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	loadProvider(cfg.Providers)
 	updateProfile(cfg)
 	loadProvider(cfg.RuleProviders)
-	runtime.GC()
+	if features.Android {
+		// Configuration parsing creates short-lived YAML and provider objects.
+		// Return their unused heap pages at this existing collection point so a
+		// freshly started Android service does not retain the loading peak.
+		debug.FreeOSMemory()
+	} else {
+		runtime.GC()
+	}
 	tunnel.OnRunning()
 	updateUpdater(cfg)
 
@@ -157,7 +167,7 @@ func GetGeneral() *config.General {
 		Mode:         tunnel.Mode(),
 		UnifiedDelay: adapter.UnifiedDelay.Load(),
 		LogLevel:     log.Level(),
-		IPv6:         !resolver.DisableIPv6,
+		IPv6:         !resolver.DisableIPv6.Load(),
 		Interface:    dialer.DefaultInterface.Load(),
 		RoutingMark:  int(dialer.DefaultRoutingMark.Load()),
 		GeoXUrl: config.GeoXUrl{
@@ -237,16 +247,33 @@ func updateNTP(c *config.NTP) {
 	}
 }
 
+var dnsRetireAfter = time.AfterFunc
+
+// WrapProxyServerResolver wraps the proxy-server resolver as it is installed,
+// before providers start dialing nodes through it.
+var WrapProxyServerResolver func(resolver.Resolver) resolver.Resolver
+
+func installedResolvers() []resolver.Resolver {
+	return []resolver.Resolver{resolver.DefaultResolver, resolver.ProxyServerHostResolver, resolver.DirectHostResolver}
+}
+
+func stopDNS() {
+	retired := installedResolvers()
+	resolver.DefaultResolver = nil
+	resolver.DefaultService = nil
+	resolver.ProxyServerHostResolver = nil
+	resolver.DirectHostResolver = nil
+	resolver.CloseQueries(retired...)
+	dns.ReCreateServer("", nil, nil)
+}
+
 func updateDNS(c *config.DNS, generalIPv6 bool) {
 	if !c.Enable {
-		resolver.DefaultResolver = nil
 		resolver.DefaultHostMapper = nil
-		resolver.DefaultService = nil
-		resolver.ProxyServerHostResolver = nil
-		resolver.DirectHostResolver = nil
-		dns.ReCreateServer("", nil)
+		stopDNS()
 		return
 	}
+	retired := installedResolvers()
 
 	ipv6 := c.IPv6 && generalIPv6
 	r := dns.NewResolver(dns.Config{
@@ -256,6 +283,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 		IPv6Timeout:          c.IPv6Timeout,
 		FallbackIPFilter:     c.FallbackIPFilter,
 		FallbackDomainFilter: c.FallbackDomainFilter,
+		FallbackLazyQuery:    c.FallbackLazyQuery,
 		Default:              c.DefaultNameserver,
 		Policy:               c.NameServerPolicy,
 		ProxyServer:          c.ProxyServerNameserver,
@@ -292,6 +320,9 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 	} else {
 		resolver.ProxyServerHostResolver = r.Resolver
 	}
+	if WrapProxyServerResolver != nil {
+		resolver.ProxyServerHostResolver = WrapProxyServerResolver(resolver.ProxyServerHostResolver)
+	}
 	resolver.ProxyServerHostResolver = resolver.WrapDNSAuthResolver(resolver.ProxyServerHostResolver)
 
 	if r.DirectResolver.Invalid() {
@@ -300,7 +331,11 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 		resolver.DirectHostResolver = r.Resolver
 	}
 
-	dns.ReCreateServer(c.Listen, s)
+	lc := inbound.NewListenConfig()
+	lc.SetRouteMark(c.ListenRoutingMark)
+	// Rule matching and proxy dials may still be waiting on the replaced resolvers.
+	dnsRetireAfter(resolver.DefaultDNSTimeout, func() { resolver.CloseQueries(retired...) })
+	dns.ReCreateServer(c.Listen, lc, s)
 }
 
 func updateHosts(tree *trie.DomainTrie[resolver.HostValue]) {
@@ -316,6 +351,8 @@ func updateRules(rules []C.Rule, subRules map[string][]C.Rule, ruleProviders map
 }
 
 func loadProvider[T P.Provider](providers map[string]T) {
+	loadedHook := DefaultProviderLoadedHook
+	loadedNames := make(chan string, len(providers))
 	load := func(pv T) {
 		name := pv.Name()
 		if pv.VehicleType() == P.Compatible {
@@ -335,6 +372,8 @@ func loadProvider[T P.Provider](providers map[string]T) {
 					log.Warnln("initial rule provider %s error: %v", name, err)
 				}
 			}
+		} else if loadedHook != nil {
+			loadedNames <- name
 		}
 	}
 
@@ -350,6 +389,14 @@ func loadProvider[T P.Provider](providers map[string]T) {
 		}()
 	}
 	wg.Wait()
+	close(loadedNames)
+	if loadedHook != nil && len(loadedNames) > 0 {
+		go func() {
+			for name := range loadedNames {
+				loadedHook(name)
+			}
+		}()
+	}
 }
 
 func updateSniffer(snifferConfig *sniffer.Config) {
@@ -393,7 +440,7 @@ func temporaryUpdateGeneral(general *config.General) func() {
 func updateGeneral(general *config.General, logging bool) {
 	tunnel.SetMode(general.Mode)
 	tunnel.SetFindProcessMode(general.FindProcessMode)
-	resolver.DisableIPv6 = !general.IPv6
+	resolver.DisableIPv6.Store(!general.IPv6)
 
 	dialer.SetTcpConcurrent(general.TCPConcurrent)
 	if logging && general.TCPConcurrent {
@@ -534,6 +581,8 @@ func Shutdown() {
 	listener.Cleanup()
 	tproxy.CleanupTProxyIPTables()
 	resolver.StoreFakePoolState()
+	// Android lib mode re-initialises in-process; the next updateDNS patches fake-IP state from this mapper.
+	stopDNS()
 
 	log.Warnln("Mihomo shutting down")
 }

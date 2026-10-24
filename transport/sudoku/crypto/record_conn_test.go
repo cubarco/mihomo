@@ -12,10 +12,19 @@ import (
 
 type captureConn struct {
 	bytes.Buffer
+	maxWrite int
 }
 
-func (c *captureConn) Read(_ []byte) (int, error)       { return 0, io.EOF }
-func (c *captureConn) Write(p []byte) (int, error)      { return c.Buffer.Write(p) }
+func (c *captureConn) Read(_ []byte) (int, error) { return 0, io.EOF }
+func (c *captureConn) Write(p []byte) (int, error) {
+	if c.maxWrite < 0 {
+		return 0, nil
+	}
+	if c.maxWrite > 0 && len(p) > c.maxWrite {
+		p = p[:c.maxWrite]
+	}
+	return c.Buffer.Write(p)
+}
 func (c *captureConn) Close() error                     { return nil }
 func (c *captureConn) LocalAddr() net.Addr              { return nil }
 func (c *captureConn) RemoteAddr() net.Addr             { return nil }
@@ -82,5 +91,54 @@ func TestRecordConn_FirstFrameUsesRandomizedCounters(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("plaintext mismatch: got %q want %q", got, want)
+	}
+}
+
+func TestRecordConn_SmallReadsReleaseFrame(t *testing.T) {
+	pskSend := sha256.Sum256([]byte("record-send"))
+	pskRecv := sha256.Sum256([]byte("record-recv"))
+
+	raw := &captureConn{maxWrite: 7}
+	writer, err := NewRecordConn(raw, "chacha20-poly1305", pskSend[:], pskRecv[:])
+	if err != nil {
+		t.Fatalf("new writer: %v", err)
+	}
+	want := bytes.Repeat([]byte("0123456789abcdef"), 1024)
+	if _, err := writer.Write(want); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	reader, err := NewRecordConn(&replayConn{reader: bytes.NewReader(raw.Bytes())}, "chacha20-poly1305", pskRecv[:], pskSend[:])
+	if err != nil {
+		t.Fatalf("new reader: %v", err)
+	}
+	got := make([]byte, len(want))
+	buf := make([]byte, 100)
+	for off := 0; off < len(got); {
+		n, err := reader.Read(buf)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if reader.readFrame != nil && reader.readOff >= len(reader.readPlain) {
+			t.Fatal("drained record still holds its frame")
+		}
+		off += copy(got[off:], buf[:n])
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("plaintext mismatch")
+	}
+	if reader.readFrame != nil {
+		t.Fatal("idle reader holds a frame")
+	}
+}
+
+func TestRecordConnZeroWriteFails(t *testing.T) {
+	key := sha256.Sum256([]byte("short-write"))
+	writer, err := NewRecordConn(&captureConn{maxWrite: -1}, "aes-128-gcm", key[:], key[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := writer.Write([]byte("hello")); n != 0 || err != io.ErrShortWrite {
+		t.Fatalf("write = %d, %v", n, err)
 	}
 }

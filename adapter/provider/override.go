@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/dlclark/regexp2"
+	"github.com/metacubex/mihomo/common/utils"
 )
 
 type overrideSchema struct {
@@ -16,6 +17,7 @@ type overrideSchema struct {
 	Down           *string `provider:"down,omitempty"`
 	DialerProxy    *string `provider:"dialer-proxy,omitempty"`
 	SkipCertVerify *bool   `provider:"skip-cert-verify,omitempty"`
+	NameCertVerify *string `provider:"name-cert-verify,omitempty"`
 	Interface      *string `provider:"interface-name,omitempty"`
 	RoutingMark    *int    `provider:"routing-mark,omitempty"`
 	IPVersion      *string `provider:"ip-version,omitempty"`
@@ -23,16 +25,29 @@ type overrideSchema struct {
 	AdditionalPrefix *string                   `provider:"additional-prefix,omitempty"`
 	AdditionalSuffix *string                   `provider:"additional-suffix,omitempty"`
 	ProxyName        []overrideProxyNameSchema `provider:"proxy-name,omitempty"`
+	OverrideExpr     []OverrideExpr            `provider:"override-expr,omitempty"`
 }
 
 type overrideProxyNameSchema struct {
 	// matching expression for regex replacement
-	Pattern *regexp2.Regexp `provider:"pattern"`
+	Pattern *namePattern `provider:"pattern"`
 	// the new content after regex matching
 	Target string `provider:"target"`
 }
 
-var _ encoding.TextUnmarshaler = (*regexp2.Regexp)(nil) // ensure *regexp2.Regexp can decode direct by structure package
+type namePattern struct {
+	*regexp2.Regexp
+}
+
+func (p *namePattern) UnmarshalText(text []byte) error {
+	compiled, err := utils.CompileNameRegex(string(text))
+	if err == nil {
+		p.Regexp = compiled
+	}
+	return err
+}
+
+var _ encoding.TextUnmarshaler = (*namePattern)(nil)
 
 func (o *overrideSchema) Apply(mapping map[string]any) error {
 	if o.TFO != nil {
@@ -59,6 +74,9 @@ func (o *overrideSchema) Apply(mapping map[string]any) error {
 	if o.SkipCertVerify != nil {
 		mapping["skip-cert-verify"] = *o.SkipCertVerify
 	}
+	if o.NameCertVerify != nil {
+		mapping["name-cert-verify"] = *o.NameCertVerify
+	}
 	if o.Interface != nil {
 		mapping["interface-name"] = *o.Interface
 	}
@@ -82,6 +100,11 @@ func (o *overrideSchema) Apply(mapping map[string]any) error {
 	}
 	if o.AdditionalSuffix != nil {
 		mapping["name"] = fmt.Sprintf("%s%s", mapping["name"], *o.AdditionalSuffix)
+	}
+	for idx, expr := range o.OverrideExpr {
+		if err := expr.Apply(mapping); err != nil {
+			return fmt.Errorf("override-expr[%d] %q: %w", idx, expr.String(), err)
+		}
 	}
 
 	return nil

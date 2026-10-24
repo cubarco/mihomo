@@ -199,6 +199,12 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 	} else {
 		udpTimeout = sing.UDPTimeout
 	}
+	var icmpTimeout time.Duration
+	if options.ICMPTimeout != 0 {
+		icmpTimeout = time.Second * time.Duration(options.ICMPTimeout)
+	} else {
+		icmpTimeout = sing.ICMPTimeout
+	}
 	tableIndex := options.IPRoute2TableIndex
 	if tableIndex == 0 {
 		tableIndex = tun.DefaultIPRoute2TableIndex
@@ -266,6 +272,10 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 			return nil, E.Cause(err, "parse exclude_mac_address")
 		}
 		excludeMACAddress = append(excludeMACAddress, addr)
+	}
+
+	if err := LC.ValidateTunDNSMode(options.DNSMode); err != nil {
+		return nil, err
 	}
 
 	var dnsAdds []netip.AddrPort
@@ -384,6 +394,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		GSO:                                   options.GSO,
 		Inet4Address:                          options.Inet4Address,
 		Inet6Address:                          options.Inet6Address,
+		DNSMode:                               options.DNSMode,
 		AutoRoute:                             options.AutoRoute,
 		IPRoute2TableIndex:                    tableIndex,
 		IPRoute2RuleIndex:                     ruleIndex,
@@ -463,12 +474,6 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		}
 
 	}
-
-	err = l.buildAndroidRules(&tunOptions)
-	if err != nil {
-		err = E.Cause(err, "build android rules")
-		return
-	}
 	tunIf, err := tunNew(tunOptions)
 	if err != nil {
 		err = E.Cause(err, "configure tun interface")
@@ -485,10 +490,12 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		TunOptions:             tunOptions,
 		EndpointIndependentNat: options.EndpointIndependentNat,
 		UDPTimeout:             udpTimeout,
+		ICMPTimeout:            icmpTimeout,
 		Handler:                handler,
 		Logger:                 log.SingLogger,
 		ForwarderBindInterface: forwarderBindInterface,
 		InterfaceFinder:        interfaceFinder,
+		TCPCongestionControl:   options.CongestionController,
 		EnforceBindInterface:   EnforceBindInterface,
 	}
 	l.tunIf = tunIf
@@ -534,8 +541,8 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 	if options.FileDescriptor != 0 {
 		tunName = fmt.Sprintf("%s(fd=%d)", tunName, options.FileDescriptor)
 	}
-	l.addrStr = fmt.Sprintf("%s(%s,%s), mtu: %d, auto route: %v, auto redir: %v, ip stack: %s",
-		tunName, tunOptions.Inet4Address, tunOptions.Inet6Address, tunMTU, options.AutoRoute, options.AutoRedirect, options.Stack)
+	l.addrStr = fmt.Sprintf("%s(%s,%s), mtu: %d, auto route: %v, auto redir: %v, ip stack: %s, dns mode: %s",
+		tunName, tunOptions.Inet4Address, tunOptions.Inet6Address, tunMTU, options.AutoRoute, options.AutoRedirect, options.Stack, options.DNSMode)
 	return
 }
 

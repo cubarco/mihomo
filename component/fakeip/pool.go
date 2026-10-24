@@ -18,10 +18,8 @@ const (
 
 type store interface {
 	GetByHost(host string) (netip.Addr, bool)
-	PutByHost(host string, ip netip.Addr)
 	GetByIP(ip netip.Addr) (string, bool)
-	PutByIP(ip netip.Addr, host string)
-	DelByIP(ip netip.Addr)
+	PutMapping(host string, ip netip.Addr)
 	Exist(ip netip.Addr) bool
 	CloneTo(store)
 	FlushFakeIP() error
@@ -50,9 +48,7 @@ func (p *Pool) Lookup(host string) netip.Addr {
 		return ip
 	}
 
-	ip := p.get(host)
-	p.store.PutByHost(host, ip)
-	return ip
+	return p.get(host)
 }
 
 // LookBack return host with the fake ip
@@ -88,7 +84,21 @@ func (p *Pool) IPNet() netip.Prefix {
 
 // CloneFrom clone cache from old pool
 func (p *Pool) CloneFrom(o *Pool) {
+	if p == o {
+		return
+	}
+	p.mux.Lock()
+	defer p.mux.Unlock()
+
+	o.mux.Lock()
+	defer o.mux.Unlock()
+
 	o.store.CloneTo(p.store)
+
+	// the allocation state only matches the cloned entries if both pools cover the same range
+	if o.first == p.first && o.last == p.last {
+		p.offset, p.cycle = o.offset, o.cycle
+	}
 }
 
 func (p *Pool) get(host string) netip.Addr {
@@ -99,15 +109,14 @@ func (p *Pool) get(host string) netip.Addr {
 		p.offset = p.first
 	}
 
-	if p.cycle || p.store.Exist(p.offset) {
-		p.store.DelByIP(p.offset)
-	}
-
-	p.store.PutByIP(p.offset, host)
+	p.store.PutMapping(host, p.offset)
 	return p.offset
 }
 
 func (p *Pool) FlushFakeIP() error {
+	p.mux.Lock()
+	defer p.mux.Unlock()
+
 	err := p.store.FlushFakeIP()
 	if err == nil {
 		p.cycle = false
@@ -117,10 +126,13 @@ func (p *Pool) FlushFakeIP() error {
 }
 
 func (p *Pool) StoreState() {
+	p.mux.Lock()
+	defer p.mux.Unlock()
+
 	if s, ok := p.store.(*cachefileStore); ok {
-		s.PutByHost(offsetKey, p.offset)
+		s.cache.PutByHost(offsetKey, p.offset)
 		if p.cycle {
-			s.PutByHost(cycleKey, p.offset)
+			s.cache.PutByHost(cycleKey, p.offset)
 		}
 	}
 }

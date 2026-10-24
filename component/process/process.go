@@ -19,15 +19,13 @@ const (
 )
 
 func FindProcessName(network string, srcIP netip.Addr, srcPort int) (uint32, string, error) {
-	return findProcessName(network, srcIP, srcPort)
+	return findProcessName(network, srcIP, srcPort, nil)
 }
 
-// PackageNameResolver
-// never change type traits because it's used in CMFA
 type PackageNameResolver func(metadata *C.Metadata) (string, error)
 
 // DefaultPackageNameResolver
-// never change type traits because it's used in CMFA
+// never change type traits because it's used in CFMA
 var DefaultPackageNameResolver PackageNameResolver
 
 func FindPackageName(metadata *C.Metadata) (string, error) {
@@ -35,4 +33,26 @@ func FindPackageName(metadata *C.Metadata) (string, error) {
 		return resolver(metadata)
 	}
 	return "", ErrPlatformNotSupport
+}
+
+type processInspector func(uint32, string)
+
+type Info struct {
+	UID  uint32
+	PID  uint32
+	Path string
+}
+
+func FindProcessInfo(network string, srcIP netip.Addr, srcPort int) (Info, error) {
+	var info Info
+	var err error
+	info.UID, info.Path, err = findProcessName(network, srcIP, srcPort, func(pid uint32, _ string) { info.PID = pid })
+	return info, err
+}
+
+func (info Info) Arguments() []string {
+	if info.PID == 0 || info.Path == "" {
+		return nil
+	}
+	return readProcessArguments(info.PID, info.Path)
 }

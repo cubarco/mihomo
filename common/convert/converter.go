@@ -8,21 +8,19 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-
-	"github.com/metacubex/mihomo/log"
 )
 
 // ConvertsV2Ray convert V2Ray subscribe proxies data to mihomo proxies config
 func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 	data := DecodeBase64(buf)
 
-	arr := strings.Split(string(data), "\n")
+	rawLines := bytes.Split(data, []byte("\n"))
 
-	proxies := make([]map[string]any, 0, len(arr))
+	proxies := make([]map[string]any, 0, len(rawLines))
 	names := make(map[string]int, 200)
 
-	for _, line := range arr {
-		line = strings.TrimRight(line, " \r")
+	for _, raw := range rawLines {
+		line := strings.TrimRight(string(raw), " \r")
 		if line == "" {
 			continue
 		}
@@ -69,8 +67,10 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 
 			proxies = append(proxies, hysteria)
 
-		case "hysteria2", "hy2":
-			urlHysteria2, err := url.Parse(line)
+		case "hysteria2", "hy2", "hysteria2+realm", "hy2+realm":
+			realmMode := strings.HasSuffix(scheme, "+realm")
+			hopLine, ports := SplitHysteria2Ports(line)
+			urlHysteria2, err := url.Parse(hopLine)
 			if err != nil {
 				continue
 			}
@@ -87,6 +87,9 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 			} else {
 				hysteria2["port"] = "443"
 			}
+			if ports != "" {
+				hysteria2["ports"] = ports
+			}
 			hysteria2["obfs"] = query.Get("obfs")
 			hysteria2["obfs-password"] = query.Get("obfs-password")
 			hysteria2["sni"] = query.Get("sni")
@@ -94,12 +97,19 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 			if alpn := query.Get("alpn"); alpn != "" {
 				hysteria2["alpn"] = strings.Split(alpn, ",")
 			}
-			if auth := urlHysteria2.User.String(); auth != "" {
-				hysteria2["password"] = auth
-			}
 			hysteria2["fingerprint"] = query.Get("pinSHA256")
 			hysteria2["down"] = query.Get("down")
 			hysteria2["up"] = query.Get("up")
+			if realmMode {
+				token, _ := url.PathUnescape(urlHysteria2.User.String())
+				realmID, _ := url.PathUnescape(strings.TrimPrefix(urlHysteria2.EscapedPath(), "/"))
+				hysteria2["realm-opts"] = buildRealmOpts("https://"+urlHysteria2.Host, token, realmID, query["stun"])
+				if auth := query.Get("auth"); auth != "" {
+					hysteria2["password"] = auth
+				}
+			} else if auth := urlHysteria2.User.String(); auth != "" {
+				hysteria2["password"] = auth
+			}
 
 			proxies = append(proxies, hysteria2)
 
@@ -219,7 +229,6 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 			vless := make(map[string]any, 20)
 			err = handleVShareLink(names, urlVLess, scheme, vless)
 			if err != nil {
-				log.Warnln("error:%s line:%s", err.Error(), line)
 				continue
 			}
 			if flow := query.Get("flow"); flow != "" {
@@ -244,7 +253,6 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 				vmess := make(map[string]any, 20)
 				err = handleVShareLink(names, urlVMess, scheme, vmess)
 				if err != nil {
-					log.Warnln("error:%s line:%s", err.Error(), line)
 					continue
 				}
 				vmess["alterId"] = 0
@@ -310,7 +318,7 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 				if strings.HasSuffix(tls, "tls") {
 					vmess["tls"] = true
 				}
-				if alpn, ok := values["alpn"].(string); ok {
+				if alpn, ok := values["alpn"].(string); ok && alpn != "" {
 					vmess["alpn"] = strings.Split(alpn, ",")
 				}
 			}
@@ -376,6 +384,10 @@ func ConvertsV2Ray(buf []byte) ([]map[string]any, error) {
 				}
 				wsOpts["headers"] = headers
 				vmess["ws-opts"] = wsOpts
+				if network == "httpupgrade" {
+					vmess["network"] = "ws"
+					wsOpts["v2ray-http-upgrade"] = true
+				}
 
 			case "grpc":
 				grpcOpts := make(map[string]any)

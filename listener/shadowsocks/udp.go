@@ -1,7 +1,9 @@
 package shadowsocks
 
 import (
+	"context"
 	"net"
+	"sync/atomic"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	N "github.com/metacubex/mihomo/common/net"
@@ -14,11 +16,11 @@ import (
 
 type UDPListener struct {
 	packetConn net.PacketConn
-	closed     bool
+	closed     atomic.Bool
 }
 
-func NewUDP(addr string, pickCipher core.Cipher, tunnel C.Tunnel, additions ...inbound.Addition) (*UDPListener, error) {
-	l, err := inbound.ListenPacket("udp", addr)
+func NewUDP(addr string, lc C.InboundListenConfig, pickCipher core.Cipher, tunnel C.Tunnel, additions ...inbound.Addition) (*UDPListener, error) {
+	l, err := lc.ListenPacket(context.Background(), "udp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -27,7 +29,7 @@ func NewUDP(addr string, pickCipher core.Cipher, tunnel C.Tunnel, additions ...i
 		log.Warnln("Failed to Reuse UDP Address: %s", err)
 	}
 
-	sl := &UDPListener{l, false}
+	sl := &UDPListener{packetConn: l}
 	conn := pickCipher.PacketConn(N.NewEnhancePacketConn(l))
 	go func() {
 		for {
@@ -36,7 +38,7 @@ func NewUDP(addr string, pickCipher core.Cipher, tunnel C.Tunnel, additions ...i
 				if put != nil {
 					put()
 				}
-				if sl.closed {
+				if sl.closed.Load() {
 					break
 				}
 				continue
@@ -49,7 +51,9 @@ func NewUDP(addr string, pickCipher core.Cipher, tunnel C.Tunnel, additions ...i
 }
 
 func (l *UDPListener) Close() error {
-	l.closed = true
+	if !l.closed.CompareAndSwap(false, true) {
+		return nil
+	}
 	return l.packetConn.Close()
 }
 
