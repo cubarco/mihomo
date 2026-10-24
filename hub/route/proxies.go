@@ -46,7 +46,7 @@ func parseProxyName(next http.Handler) http.Handler {
 func findProxyByName(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		name := r.Context().Value(CtxKeyProxyName).(string)
-		proxies := tunnel.Proxies()
+		proxies := proxiesWithProviders()
 		proxy, exist := proxies[name]
 		if !exist {
 			render.Status(r, http.StatusNotFound)
@@ -60,7 +60,30 @@ func findProxyByName(next http.Handler) http.Handler {
 }
 
 func getProxies(w http.ResponseWriter, r *http.Request) {
-	writeProxiesJSON(w, r, tunnel.Proxies())
+	writeProxiesJSON(w, r, proxiesWithProviders())
+}
+
+// proxiesWithProviders preserves the custom Controller API behavior: /proxies
+// and /proxies/{name} include nodes loaded through proxy-providers as well as
+// runtime proxies. Provider nodes take precedence on duplicate names.
+func proxiesWithProviders() map[string]C.Proxy {
+	runtimeProxies := tunnel.Proxies()
+	providers := tunnel.Providers()
+	all := make(map[string]C.Proxy, len(runtimeProxies))
+	for name, proxy := range runtimeProxies {
+		all[name] = proxy
+	}
+	for _, provider := range providers {
+		if provider == nil {
+			continue
+		}
+		for _, proxy := range provider.Proxies() {
+			if proxy != nil {
+				all[proxy.Name()] = proxy
+			}
+		}
+	}
+	return all
 }
 
 func getProxy(w http.ResponseWriter, r *http.Request) {

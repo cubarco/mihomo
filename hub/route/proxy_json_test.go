@@ -2,6 +2,7 @@ package route
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -100,7 +101,7 @@ func TestControllerJSONMatchesRender(t *testing.T) {
 				handler http.HandlerFunc
 				value   any
 			}{
-				{"proxies", getProxies, render.M{"proxies": tc.proxies}},
+				{"proxies", func(w http.ResponseWriter, r *http.Request) { writeProxiesJSON(w, r, tc.proxies) }, render.M{"proxies": tc.proxies}},
 				{"providers", getProviders, render.M{"providers": tc.providers}},
 			} {
 				t.Run(route.name, func(t *testing.T) {
@@ -131,6 +132,55 @@ func TestControllerJSONMatchesRender(t *testing.T) {
 			require.Equal(t, want.Body.String(), got.Body.String())
 		})
 	}
+}
+
+func TestControllerProxiesIncludesProviderNodes(t *testing.T) {
+	oldProxies, oldProviders := tunnel.Proxies(), tunnel.Providers()
+	t.Cleanup(func() { tunnel.UpdateProxies(oldProxies, oldProviders) })
+
+	newProxy := func(name string) C.Proxy {
+		return adapter.NewProxy(outbound.NewBase(outbound.BaseOption{Name: name, Type: C.Direct}))
+	}
+	runtimeNode := newProxy("runtime-node")
+	runtimeShared := newProxy("shared")
+	providerNode := newProxy("provider-node")
+	providerShared := newProxy("shared")
+	p, err := provider.NewProxySetProvider(
+		"subscription", 0,
+		[]map[string]any{{"name": "provider-node", "type": "direct"}},
+		func([]byte) ([]C.Proxy, error) { return []C.Proxy{providerNode, providerShared}, nil },
+		resource.NewHTTPVehicle("https://example.invalid/subscription", "unused", "", nil, time.Second, 1024),
+		provider.NewHealthCheck(nil, "", 0, 0, true, nil),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, p.Close()) })
+	require.Equal(t, P.HTTP, p.VehicleType())
+	tunnel.UpdateProxies(
+		map[string]C.Proxy{"runtime-node": runtimeNode, "shared": runtimeShared},
+		map[string]P.ProxyProvider{p.Name(): p},
+	)
+
+	merged := proxiesWithProviders()
+	require.Len(t, merged, 3)
+	require.Same(t, runtimeNode, merged["runtime-node"])
+	require.Same(t, providerNode, merged["provider-node"])
+	require.Same(t, providerShared, merged["shared"])
+
+	response := httptest.NewRecorder()
+	getProxies(response, httptest.NewRequest("GET", "/proxies", nil))
+	require.Equal(t, http.StatusOK, response.Code)
+	var body struct {
+		Proxies map[string]json.RawMessage `json:"proxies"`
+	}
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+	require.Len(t, body.Proxies, 3)
+	require.Contains(t, body.Proxies, "provider-node")
+
+	request := httptest.NewRequest("GET", "/proxies/provider-node", nil)
+	request = request.WithContext(context.WithValue(request.Context(), CtxKeyProxyName, "provider-node"))
+	response = httptest.NewRecorder()
+	findProxyByName(http.HandlerFunc(getProxy)).ServeHTTP(response, request)
+	require.Equal(t, http.StatusOK, response.Code)
 }
 
 func TestControllerJSONEarlyErrorsKeepHTTP500(t *testing.T) {
