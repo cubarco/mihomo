@@ -53,7 +53,7 @@ func TestSnellV6Profile(t *testing.T) {
 			}
 			s.Close()
 		}
-		for _, change := range []map[string]any{{"alpn": "snell-ech/1"}, {"legacy-fallback": true}, {"identity-version": 1}, {"skip-cert-verify": true}, {"mode": ""}} {
+		for _, change := range []map[string]any{{"alpn": "snell-ech/1"}, {"skip-cert-verify": true}, {"mode": ""}} {
 			bad := opt
 			bad.ObfsOpts = map[string]any{"mode": "ech-tls", "ech-config": echConfig, "transport": transport}
 			for k, v := range change {

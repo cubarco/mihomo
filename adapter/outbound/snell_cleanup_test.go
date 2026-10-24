@@ -20,6 +20,8 @@ import (
 
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/transport/snell"
+
+	"github.com/metacubex/tls"
 )
 
 // countingSnellDialer counts dials, and hands out the connections newConn makes
@@ -127,12 +129,15 @@ func TestSnellUDPHandshakeFailureClosesRawConnection(t *testing.T) {
 }
 
 func TestSnellPoolWarmupCancellationClosesRawConnection(t *testing.T) {
-	raw, peer := net.Pipe()
-	t.Cleanup(func() { _ = raw.Close(); _ = peer.Close() })
+	serverConfig, echConfig, caPEM := snellECHTestServer(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
 	adapter, err := NewSnell(SnellOption{
-		BasicOption: BasicOption{DialerForAPI: cleanupTestDialer{conn: raw}},
-		Name:        "snell", Server: "127.0.0.1", Port: 443, Psk: "password",
-		Version: snell.Version4, Identity: true, IdentityConfigured: true,
+		Name: "snell", Server: "127.0.0.1", Port: listener.Addr().(*net.TCPAddr).Port, Psk: "password", Version: snell.Version4,
+		ObfsOpts: map[string]any{"mode": "ech-tls", "ech-config": echConfig, "sni": "origin.example.com", "ca-file": caPEM},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +153,13 @@ func TestSnellPoolWarmupCancellationClosesRawConnection(t *testing.T) {
 		}
 		done <- err
 	}()
-	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	raw, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	peer := tls.Server(raw, serverConfig)
+	_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := peer.Read(make([]byte, 4096)); err != nil {
 		t.Fatalf("warmup did not start: %v", err)
 	}

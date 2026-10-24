@@ -8,6 +8,7 @@ import (
 )
 
 const (
+	IdentityHeaderLength   = 16
 	IdentityAuthTagLength  = 16
 	IdentityExporterLength = 32
 	IdentityExporterLabel  = "EXPORTER-Dler-Snell-Identity-v2"
