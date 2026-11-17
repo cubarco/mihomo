@@ -50,6 +50,7 @@ type System struct {
 	bindInterface        bool
 	interfaceFinder      control.InterfaceFinder
 	enforceBind          bool
+	tcpKeepAlive         func(net.Conn)
 	frontHeadroom        int
 	txChecksumOffload    bool
 	recvMsgX             bool
@@ -81,6 +82,7 @@ func NewSystem(options StackOptions) (Stack, error) {
 		interfaceFinder:      options.InterfaceFinder,
 		recvMsgX:             options.TunOptions.EXP_RecvMsgX,
 		enforceBind:          options.EnforceBindInterface,
+		tcpKeepAlive:         options.TCPKeepAlive,
 	}
 	if len(options.TunOptions.Inet4Address) > 0 {
 		if !HasNextAddress(options.TunOptions.Inet4Address[0], 1) {
@@ -356,6 +358,9 @@ func (s *System) acceptLoop(listener net.Listener, tcpNat *TCPNat) {
 		if session == nil {
 			s.logger.Trace(E.New("unknown session with port ", connPort))
 			continue
+		}
+		if s.tcpKeepAlive != nil {
+			s.tcpKeepAlive(conn)
 		}
 		go func() {
 			_ = s.handler.NewConnection(s.ctx, conn, M.Metadata{

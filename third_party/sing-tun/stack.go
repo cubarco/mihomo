@@ -36,6 +36,7 @@ type StackOptions struct {
 	InterfaceFinder        control.InterfaceFinder
 	TCPCongestionControl   string
 	EnforceBindInterface   bool
+	TCPKeepAlive           func(net.Conn)
 }
 
 func NewStack(
