@@ -70,6 +70,6 @@ func handleRedir(conn net.Conn, tunnel C.Tunnel, additions ...inbound.Addition) 
 		conn.Close()
 		return
 	}
-	keepalive.TCPKeepAlive(conn)
+	keepalive.InboundTCPKeepAlive(conn)
 	tunnel.HandleTCPConn(inbound.NewSocket(target, conn, C.REDIR, additions...))
 }

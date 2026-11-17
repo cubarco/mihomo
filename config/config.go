@@ -47,27 +47,30 @@ import (
 // General config
 type General struct {
 	Inbound
-	Mode                    T.TunnelMode            `json:"mode"`
-	UnifiedDelay            bool                    `json:"unified-delay"`
-	LogLevel                log.LogLevel            `json:"log-level"`
-	IPv6                    bool                    `json:"ipv6"`
-	Interface               string                  `json:"interface-name"`
-	RoutingMark             int                     `json:"routing-mark"`
-	GeoXUrl                 GeoXUrl                 `json:"geox-url"`
-	GeoAutoUpdate           bool                    `json:"geo-auto-update"`
-	GeoUpdateInterval       int                     `json:"geo-update-interval"`
-	GeodataMode             bool                    `json:"geodata-mode"`
-	GeodataLoader           string                  `json:"geodata-loader"`
-	GeositeMatcher          string                  `json:"geosite-matcher"`
-	TCPConcurrent           bool                    `json:"tcp-concurrent"`
-	FindProcessMode         process.FindProcessMode `json:"find-process-mode"`
-	Sniffing                bool                    `json:"sniffing"`
-	GlobalClientFingerprint string                  `json:"global-client-fingerprint"`
-	GlobalUA                string                  `json:"global-ua"`
-	ETagSupport             bool                    `json:"etag-support"`
-	KeepAliveIdle           int                     `json:"keep-alive-idle"`
-	KeepAliveInterval       int                     `json:"keep-alive-interval"`
-	DisableKeepAlive        bool                    `json:"disable-keep-alive"`
+	Mode                     T.TunnelMode            `json:"mode"`
+	UnifiedDelay             bool                    `json:"unified-delay"`
+	LogLevel                 log.LogLevel            `json:"log-level"`
+	IPv6                     bool                    `json:"ipv6"`
+	Interface                string                  `json:"interface-name"`
+	RoutingMark              int                     `json:"routing-mark"`
+	GeoXUrl                  GeoXUrl                 `json:"geox-url"`
+	GeoAutoUpdate            bool                    `json:"geo-auto-update"`
+	GeoUpdateInterval        int                     `json:"geo-update-interval"`
+	GeodataMode              bool                    `json:"geodata-mode"`
+	GeodataLoader            string                  `json:"geodata-loader"`
+	GeositeMatcher           string                  `json:"geosite-matcher"`
+	TCPConcurrent            bool                    `json:"tcp-concurrent"`
+	FindProcessMode          process.FindProcessMode `json:"find-process-mode"`
+	Sniffing                 bool                    `json:"sniffing"`
+	GlobalClientFingerprint  string                  `json:"global-client-fingerprint"`
+	GlobalUA                 string                  `json:"global-ua"`
+	ETagSupport              bool                    `json:"etag-support"`
+	KeepAliveIdle            int                     `json:"keep-alive-idle"`
+	KeepAliveInterval        int                     `json:"keep-alive-interval"`
+	DisableKeepAlive         bool                    `json:"disable-keep-alive"`
+	InboundKeepAliveIdle     *int                    `json:"inbound-keep-alive-idle,omitempty"`
+	InboundKeepAliveInterval *int                    `json:"inbound-keep-alive-interval,omitempty"`
+	InboundDisableKeepAlive  *bool                   `json:"inbound-disable-keep-alive,omitempty"`
 }
 
 // Inbound config
@@ -446,6 +449,9 @@ type RawConfig struct {
 	KeepAliveIdle                 int                     `yaml:"keep-alive-idle" json:"keep-alive-idle"`
 	KeepAliveInterval             int                     `yaml:"keep-alive-interval" json:"keep-alive-interval"`
 	DisableKeepAlive              bool                    `yaml:"disable-keep-alive" json:"disable-keep-alive"`
+	InboundKeepAliveIdle          *int                    `yaml:"inbound-keep-alive-idle" json:"inbound-keep-alive-idle"`
+	InboundKeepAliveInterval      *int                    `yaml:"inbound-keep-alive-interval" json:"inbound-keep-alive-interval"`
+	InboundDisableKeepAlive       *bool                   `yaml:"inbound-disable-keep-alive" json:"inbound-disable-keep-alive"`
 
 	ProxyProvider map[string]map[string]any `yaml:"proxy-providers" json:"proxy-providers"`
 	RuleProvider  map[string]map[string]any `yaml:"rule-providers" json:"rule-providers"`
@@ -756,6 +762,12 @@ func ParseRawConfig(rawCfg *RawConfig) (*Config, error) {
 func temporaryUpdateGeneral(general *General) func()
 
 func parseGeneral(cfg *RawConfig) (*General, error) {
+	if cfg.InboundKeepAliveIdle != nil && *cfg.InboundKeepAliveIdle < 0 {
+		return nil, fmt.Errorf("inbound-keep-alive-idle must be non-negative")
+	}
+	if cfg.InboundKeepAliveInterval != nil && *cfg.InboundKeepAliveInterval < 0 {
+		return nil, fmt.Errorf("inbound-keep-alive-interval must be non-negative")
+	}
 	return &General{
 		Inbound: Inbound{
 			Port:              cfg.Port,
@@ -785,19 +797,22 @@ func parseGeneral(cfg *RawConfig) (*General, error) {
 			ASN:     cfg.GeoXUrl.ASN,
 			GeoSite: cfg.GeoXUrl.GeoSite,
 		},
-		GeoAutoUpdate:           cfg.GeoAutoUpdate,
-		GeoUpdateInterval:       cfg.GeoUpdateInterval,
-		GeodataMode:             cfg.GeodataMode,
-		GeodataLoader:           cfg.GeodataLoader,
-		GeositeMatcher:          cfg.GeositeMatcher,
-		TCPConcurrent:           cfg.TCPConcurrent,
-		FindProcessMode:         cfg.FindProcessMode,
-		GlobalClientFingerprint: cfg.GlobalClientFingerprint,
-		GlobalUA:                cfg.GlobalUA,
-		ETagSupport:             cfg.ETagSupport,
-		KeepAliveIdle:           cfg.KeepAliveIdle,
-		KeepAliveInterval:       cfg.KeepAliveInterval,
-		DisableKeepAlive:        cfg.DisableKeepAlive,
+		GeoAutoUpdate:            cfg.GeoAutoUpdate,
+		GeoUpdateInterval:        cfg.GeoUpdateInterval,
+		GeodataMode:              cfg.GeodataMode,
+		GeodataLoader:            cfg.GeodataLoader,
+		GeositeMatcher:           cfg.GeositeMatcher,
+		TCPConcurrent:            cfg.TCPConcurrent,
+		FindProcessMode:          cfg.FindProcessMode,
+		GlobalClientFingerprint:  cfg.GlobalClientFingerprint,
+		GlobalUA:                 cfg.GlobalUA,
+		ETagSupport:              cfg.ETagSupport,
+		KeepAliveIdle:            cfg.KeepAliveIdle,
+		KeepAliveInterval:        cfg.KeepAliveInterval,
+		DisableKeepAlive:         cfg.DisableKeepAlive,
+		InboundKeepAliveIdle:     cfg.InboundKeepAliveIdle,
+		InboundKeepAliveInterval: cfg.InboundKeepAliveInterval,
+		InboundDisableKeepAlive:  cfg.InboundDisableKeepAlive,
 	}, nil
 }
 

@@ -2,7 +2,10 @@
 
 package keepalive
 
-import "net"
+import (
+	"net"
+	"time"
+)
 
 type TCPConn interface {
 	net.Conn
@@ -11,11 +14,15 @@ type TCPConn interface {
 }
 
 func keepAliveConfig() net.KeepAliveConfig {
-	config := net.KeepAliveConfig{
-		Enable:   true,
-		Idle:     KeepAliveIdle(),
-		Interval: KeepAliveInterval(),
-	}
+	return newKeepAliveConfig(KeepAliveIdle(), KeepAliveInterval())
+}
+
+func inboundKeepAliveConfig() net.KeepAliveConfig {
+	return newKeepAliveConfig(InboundKeepAliveIdle(), InboundKeepAliveInterval())
+}
+
+func newKeepAliveConfig(idle, interval time.Duration) net.KeepAliveConfig {
+	config := net.KeepAliveConfig{Enable: true, Idle: idle, Interval: interval}
 	if !SupportTCPKeepAliveCount() {
 		// it's recommended to set both Idle and Interval to non-negative values in conjunction with a -1
 		// for Count on those old Windows if you intend to customize the TCP keep-alive settings.
@@ -32,6 +39,14 @@ func tcpKeepAlive(tcp TCPConn) {
 	}
 }
 
+func inboundTCPKeepAlive(tcp TCPConn) {
+	if InboundDisableKeepAlive() {
+		_ = tcp.SetKeepAlive(false)
+	} else {
+		_ = tcp.SetKeepAliveConfig(inboundKeepAliveConfig())
+	}
+}
+
 func setNetDialer(dialer *net.Dialer) {
 	if DisableKeepAlive() {
 		dialer.KeepAlive = -1 // If negative, keep-alive probes are disabled.
@@ -42,10 +57,10 @@ func setNetDialer(dialer *net.Dialer) {
 }
 
 func setNetListenConfig(lc *net.ListenConfig) {
-	if DisableKeepAlive() {
+	if InboundDisableKeepAlive() {
 		lc.KeepAlive = -1 // If negative, keep-alive probes are disabled.
 		lc.KeepAliveConfig.Enable = false
 	} else {
-		lc.KeepAliveConfig = keepAliveConfig()
+		lc.KeepAliveConfig = inboundKeepAliveConfig()
 	}
 }

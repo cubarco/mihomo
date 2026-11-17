@@ -55,3 +55,91 @@ func TestTCPKeepAliveUsesCurrentSettings(t *testing.T) {
 		t.Fatalf("keepalive was not disabled: %+v", third)
 	}
 }
+
+func TestInboundKeepAliveOverridesDoNotChangeOutbound(t *testing.T) {
+	previousIdle := KeepAliveIdle()
+	previousInterval := KeepAliveInterval()
+	previousDisabled := DisableKeepAlive()
+	previousInboundIdle := InboundKeepAliveIdleOverride()
+	previousInboundInterval := InboundKeepAliveIntervalOverride()
+	previousInboundDisabled := InboundDisableKeepAliveOverride()
+	t.Cleanup(func() {
+		SetKeepAliveIdle(previousIdle)
+		SetKeepAliveInterval(previousInterval)
+		SetDisableKeepAlive(previousDisabled)
+		SetInboundKeepAliveIdle(previousInboundIdle)
+		SetInboundKeepAliveInterval(previousInboundInterval)
+		SetInboundDisableKeepAlive(previousInboundDisabled)
+	})
+
+	SetKeepAliveIdle(120 * time.Second)
+	SetKeepAliveInterval(120 * time.Second)
+	SetDisableKeepAlive(false)
+	SetInboundKeepAliveIdle(nil)
+	SetInboundKeepAliveInterval(nil)
+	SetInboundDisableKeepAlive(nil)
+	value := 3600 * time.Second
+	SetInboundKeepAliveIdle(&value)
+	SetInboundKeepAliveInterval(&value)
+
+	inbound := &testTCPConn{}
+	InboundTCPKeepAlive(inbound)
+	if !inbound.config.Enable || inbound.config.Idle != value || inbound.config.Interval != value {
+		t.Fatalf("inbound override not applied: %+v", inbound.config)
+	}
+	outbound := &net.Dialer{}
+	SetNetDialer(outbound)
+	if outbound.KeepAliveConfig.Idle != 120*time.Second || outbound.KeepAliveConfig.Interval != 120*time.Second {
+		t.Fatalf("outbound settings changed: %+v", outbound.KeepAliveConfig)
+	}
+	listener := &net.ListenConfig{}
+	SetNetListenConfig(listener)
+	if listener.KeepAliveConfig.Idle != value || listener.KeepAliveConfig.Interval != value {
+		t.Fatalf("inbound listener override not applied: %+v", listener.KeepAliveConfig)
+	}
+
+	// New inbound connections observe reloads; outbound connections keep their own settings.
+	newValue := 600 * time.Second
+	SetInboundKeepAliveIdle(&newValue)
+	second := &testTCPConn{}
+	InboundTCPKeepAlive(second)
+	if second.config.Idle != newValue || second.config.Interval != value || inbound.config.Idle != value {
+		t.Fatalf("inbound reload changed wrong connections: old=%+v new=%+v", inbound.config, second.config)
+	}
+	if outbound.KeepAliveConfig.Idle != 120*time.Second {
+		t.Fatalf("outbound dialer was changed: %+v", outbound.KeepAliveConfig)
+	}
+
+	SetInboundKeepAliveIdle(nil)
+	SetInboundKeepAliveInterval(nil)
+	SetKeepAliveIdle(240 * time.Second)
+	third := &testTCPConn{}
+	InboundTCPKeepAlive(third)
+	if third.config.Idle != 240*time.Second || third.config.Interval != 120*time.Second {
+		t.Fatalf("unset overrides did not inherit global settings: %+v", third.config)
+	}
+
+	disable := true
+	SetInboundDisableKeepAlive(&disable)
+	fourth := &testTCPConn{}
+	InboundTCPKeepAlive(fourth)
+	if !fourth.disabled || fourth.config.Enable {
+		t.Fatalf("inbound disable override was not applied: %+v", fourth)
+	}
+	SetNetDialer(outbound)
+	if !outbound.KeepAliveConfig.Enable {
+		t.Fatal("inbound disable override disabled outbound keepalive")
+	}
+	disable = false
+	SetInboundDisableKeepAlive(&disable)
+	SetDisableKeepAlive(true)
+	fifth := &testTCPConn{}
+	InboundTCPKeepAlive(fifth)
+	if !fifth.config.Enable || fifth.disabled {
+		t.Fatalf("explicit inbound enable did not override global disable: %+v", fifth)
+	}
+	SetNetDialer(outbound)
+	if outbound.KeepAliveConfig.Enable {
+		t.Fatal("global disable did not apply to outbound dialer")
+	}
+}

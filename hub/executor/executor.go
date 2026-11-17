@@ -137,6 +137,22 @@ func initInnerTcp() {
 	inner.New(tunnel.Tunnel)
 }
 
+func optionalKeepAliveDuration(seconds *int) *time.Duration {
+	if seconds == nil {
+		return nil
+	}
+	duration := time.Duration(*seconds) * time.Second
+	return &duration
+}
+
+func optionalKeepAliveSeconds(duration *time.Duration) *int {
+	if duration == nil {
+		return nil
+	}
+	seconds := int(*duration / time.Second)
+	return &seconds
+}
+
 func GetGeneral() *config.General {
 	ports := listener.GetPorts()
 	var authenticator []string
@@ -176,20 +192,23 @@ func GetGeneral() *config.General {
 			ASN:     geodata.ASNUrl(),
 			GeoSite: geodata.GeoSiteUrl(),
 		},
-		GeoAutoUpdate:           updater.GeoAutoUpdate(),
-		GeoUpdateInterval:       updater.GeoUpdateInterval(),
-		GeodataMode:             geodata.GeodataMode(),
-		GeodataLoader:           geodata.LoaderName(),
-		GeositeMatcher:          geodata.SiteMatcherName(),
-		TCPConcurrent:           dialer.GetTcpConcurrent(),
-		FindProcessMode:         tunnel.FindProcessMode(),
-		Sniffing:                tunnel.IsSniffing(),
-		GlobalClientFingerprint: tlsC.GetGlobalFingerprint(),
-		GlobalUA:                mihomoHttp.UA(),
-		ETagSupport:             resource.ETag(),
-		KeepAliveInterval:       int(keepalive.KeepAliveInterval() / time.Second),
-		KeepAliveIdle:           int(keepalive.KeepAliveIdle() / time.Second),
-		DisableKeepAlive:        keepalive.DisableKeepAlive(),
+		GeoAutoUpdate:            updater.GeoAutoUpdate(),
+		GeoUpdateInterval:        updater.GeoUpdateInterval(),
+		GeodataMode:              geodata.GeodataMode(),
+		GeodataLoader:            geodata.LoaderName(),
+		GeositeMatcher:           geodata.SiteMatcherName(),
+		TCPConcurrent:            dialer.GetTcpConcurrent(),
+		FindProcessMode:          tunnel.FindProcessMode(),
+		Sniffing:                 tunnel.IsSniffing(),
+		GlobalClientFingerprint:  tlsC.GetGlobalFingerprint(),
+		GlobalUA:                 mihomoHttp.UA(),
+		ETagSupport:              resource.ETag(),
+		KeepAliveInterval:        int(keepalive.KeepAliveInterval() / time.Second),
+		KeepAliveIdle:            int(keepalive.KeepAliveIdle() / time.Second),
+		DisableKeepAlive:         keepalive.DisableKeepAlive(),
+		InboundKeepAliveIdle:     optionalKeepAliveSeconds(keepalive.InboundKeepAliveIdleOverride()),
+		InboundKeepAliveInterval: optionalKeepAliveSeconds(keepalive.InboundKeepAliveIntervalOverride()),
+		InboundDisableKeepAlive:  keepalive.InboundDisableKeepAliveOverride(),
 	}
 
 	return general
@@ -453,6 +472,9 @@ func updateGeneral(general *config.General, logging bool) {
 	keepalive.SetKeepAliveIdle(time.Duration(general.KeepAliveIdle) * time.Second)
 	keepalive.SetKeepAliveInterval(time.Duration(general.KeepAliveInterval) * time.Second)
 	keepalive.SetDisableKeepAlive(general.DisableKeepAlive)
+	keepalive.SetInboundKeepAliveIdle(optionalKeepAliveDuration(general.InboundKeepAliveIdle))
+	keepalive.SetInboundKeepAliveInterval(optionalKeepAliveDuration(general.InboundKeepAliveInterval))
+	keepalive.SetInboundDisableKeepAlive(general.InboundDisableKeepAlive)
 
 	adapter.UnifiedDelay.Store(general.UnifiedDelay)
 

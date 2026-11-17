@@ -22,6 +22,15 @@ func tcpKeepAlive(tcp TCPConn) {
 	}
 }
 
+func inboundTCPKeepAlive(tcp TCPConn) {
+	if InboundDisableKeepAlive() {
+		_ = tcp.SetKeepAlive(false)
+	} else {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(InboundKeepAliveInterval())
+	}
+}
+
 func setNetDialer(dialer *net.Dialer) {
 	if DisableKeepAlive() {
 		dialer.KeepAlive = -1 // If negative, keep-alive probes are disabled.
@@ -31,9 +40,9 @@ func setNetDialer(dialer *net.Dialer) {
 }
 
 func setNetListenConfig(lc *net.ListenConfig) {
-	if DisableKeepAlive() {
+	if InboundDisableKeepAlive() {
 		lc.KeepAlive = -1 // If negative, keep-alive probes are disabled.
 	} else {
-		lc.KeepAlive = KeepAliveInterval()
+		lc.KeepAlive = InboundKeepAliveInterval()
 	}
 }

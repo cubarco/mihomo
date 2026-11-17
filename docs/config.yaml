@@ -104,6 +104,11 @@ external-doh-server: /dns-query
 # disable-keep-alive: false #目前在android端强制为true
 # keep-alive-idle: 15
 # keep-alive-interval: 15
+# Inbound TCP only (seconds); omitted fields inherit the corresponding values above.
+# This applies to TCP listeners and accepted TUN system connections, not outbound dials.
+# inbound-keep-alive-idle: 3600
+# inbound-keep-alive-interval: 3600
+# inbound-disable-keep-alive: false
 
 # routing-mark:6666 # 配置 fwmark 仅用于 Linux
 experimental:

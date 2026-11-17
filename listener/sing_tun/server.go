@@ -498,7 +498,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		InterfaceFinder:        interfaceFinder,
 		TCPCongestionControl:   options.CongestionController,
 		EnforceBindInterface:   EnforceBindInterface,
-		TCPKeepAlive:           keepalive.TCPKeepAlive,
+		TCPKeepAlive:           keepalive.InboundTCPKeepAlive,
 	}
 	l.tunIf = tunIf
 
